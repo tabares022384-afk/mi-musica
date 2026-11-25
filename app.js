@@ -457,21 +457,50 @@
     try { S.permiso = (await S.carpeta.requestPermission({ mode: 'read' })) === 'granted'; } catch (e) { S.permiso = false; }
     return S.permiso;
   }
+  // Recorre la carpeta. Muestra en vivo: carpeta actual, carpetas revisadas, canciones encontradas. Lee de a 12 a la vez.
+  const CARPETAS_SALTAR = /^(android|\.thumbnails|thumbnails|cache|\.cache|lost\.dir|notifications|ringtones|alarms)$/i;
   async function leerDisco(avance) {
-    const disco = new Map(); let n = 0;
+    const disco = new Map(), est = { carpetas: 0, canciones: 0, actual: '' };
     async function recorrer(dir, base) {
+      if (S.cancelar) throw new Error('cancelado');
+      est.carpetas++; est.actual = base || dir.name; avance && avance(est);
+      const archivos = [];
       for await (const [nombre, h] of dir.entries()) {
+        if (S.cancelar) throw new Error('cancelado');
         if (nombre.startsWith('.')) continue;
         const ruta = base ? base + '/' + nombre : nombre;
-        if (h.kind === 'directory') { await recorrer(h, ruta); continue; }
-        if (!EXT_AUDIO.test(nombre)) continue;
-        const f = await h.getFile();
-        disco.set(ruta.toLowerCase(), { ruta, nombre, tamano: f.size, mtime: f.lastModified, archivo: f });
-        if (++n % 100 === 0 && avance) avance(n);
+        if (h.kind === 'directory') { if (!CARPETAS_SALTAR.test(nombre)) await recorrer(h, ruta); continue; }
+        if (EXT_AUDIO.test(nombre)) archivos.push([ruta, nombre, h]);
+      }
+      for (let i = 0; i < archivos.length; i += 12) {
+        if (S.cancelar) throw new Error('cancelado');
+        await Promise.all(archivos.slice(i, i + 12).map(async ([ruta, nombre, h]) => {
+          try { const f = await h.getFile(); disco.set(ruta.toLowerCase(), { ruta, nombre, tamano: f.size, mtime: f.lastModified }); } catch (e) {}
+        }));
+        est.canciones = disco.size; avance && avance(est);
       }
     }
     await recorrer(S.carpeta, '');
     return disco;
+  }
+  // Ventana de avance: se actualiza sola cada medio segundo (no frena la lectura)
+  function ventanaAvance(titulo, ayuda) {
+    S.cancelar = false;
+    const inicio = Date.now();
+    modal(`<h2>${titulo}</h2><div class="caja"><p id="avTxt" style="font-size:1.25rem;font-weight:800">Empezando…</p><p id="avSub" class="suave peq"></p>
+      <div class="progreso-carga"><i id="avBar" style="width:5%"></i></div><p id="avTiempo" class="suave peq">0:00</p></div>
+      <p class="ayuda">${ayuda}</p><div class="botones"><button class="btn sec" data-accion="cancelarEscaneo">✖ Cancelar</button></div>`);
+    const t = setInterval(() => {
+      const e = $('#avTiempo'); if (!e) return clearInterval(t);
+      e.textContent = '⏱ ' + mmss((Date.now() - inicio) / 1000);
+      const b = $('#avBar'); if (b && b.dataset.indef) b.style.width = (5 + ((Date.now() - inicio) / 300) % 90) + '%';
+    }, 500);
+    const bar = $('#avBar'); if (bar) bar.dataset.indef = '1';
+    return {
+      texto(a, sub) { const x = $('#avTxt'); if (x) x.textContent = a; const y = $('#avSub'); if (y && sub != null) y.textContent = sub; },
+      porcentaje(p) { const b = $('#avBar'); if (b) { delete b.dataset.indef; b.style.width = Math.max(2, Math.min(100, p)) + '%'; } },
+      fin() { clearInterval(t); },
+    };
   }
   function compararCarpeta(disco) {
     const enApp = new Map([...S.canciones.values()].filter(c => c.origen === 'carpeta').map(c => [(c.ruta || '').toLowerCase(), c]));
@@ -497,19 +526,28 @@
     if (S.escaneando || !S.carpeta) return;
     if (!S.permiso) { if (modo === 'auto') { pintar(); return; } if (!(await pedirPermiso())) return toast('Sin permiso no puedo leer tu carpeta', true); }
     S.escaneando = true;
+    let av = null, ultimo = 0;
     try {
-      if (modo === 'manual') modal(`<h2>🔍 Escaneando ${esc(S.carpeta.name)}…</h2><p id="avTxt">Buscando canciones…</p><p class="ayuda">Solo se leen nombres y tamaños; nada se cambia todavía.</p>`);
-      const disco = await leerDisco(n => { const t = $('#avTxt'); if (t) t.textContent = `${miles(n)} canciones encontradas…`; });
+      if (modo === 'manual') av = ventanaAvance(`🔍 Leyendo «${esc(S.carpeta.name)}»`, 'Solo se leen nombres y tamaños de las canciones. Puedes cancelar cuando quieras: no se pierde nada.');
+      const disco = await leerDisco(est => {
+        if (!av || Date.now() - ultimo < 250) return; ultimo = Date.now();
+        av.texto(`🎵 ${miles(est.canciones)} canciones encontradas`, `📁 ${miles(est.carpetas)} carpetas revisadas · ahora en: ${est.actual}`);
+      });
       const dif = compararCarpeta(disco);
       S._dif = dif;
       await DB.guardarConfig('ultimoEscaneo', ahora()); S.ultimoEscaneo = ahora();
-      if (!dif.hayCambios) { if (modo === 'manual') { cerrarModal(); toast(`✅ Sin cambios · ${miles(dif.totalDisco)} canciones`); } return; }
+      if (av) av.fin();
+      if (!dif.hayCambios) { if (modo === 'manual') { cerrarModal(); toast(dif.totalDisco ? `✅ Sin cambios · ${miles(dif.totalDisco)} canciones` : '⚠️ No encontré canciones en esa carpeta', !dif.totalDisco); } return; }
+      // Primera vez (la app no tenía canciones de la carpeta): entra directo, sin preguntar
       // Automático: aplica nuevas, modificadas y movidas. Las borradas también, salvo que sean demasiadas (¿carpeta desconectada?)
-      if (modo === 'auto' && !dif.sospechoso) { await aplicarEscaneo(dif, 'auto'); return; }
+      if (dif.totalApp === 0 || (modo === 'auto' && !dif.sospechoso)) { await aplicarEscaneo(dif, modo); return; }
       mostrarEscaneo(dif);
     } catch (e) {
-      cerrarModal(); if (modo === 'manual') toast('⚠️ No pude leer la carpeta: ' + e.message, true);
-    } finally { S.escaneando = false; }
+      if (av) av.fin();
+      cerrarModal();
+      if (e.message === 'cancelado') toast('Escaneo cancelado. No se cambió nada.');
+      else if (modo === 'manual') toast('⚠️ No pude leer la carpeta: ' + e.message, true);
+    } finally { S.escaneando = false; S.cancelar = false; }
   }
   function mostrarEscaneo(dif) {
     const lista = (arr, f) => arr.slice(0, 25).map(f).map(esc).join(' · ') + (arr.length > 25 ? ' …' : '');
@@ -525,35 +563,69 @@
       <div class="botones">${dif.faltan.length ? '<button class="btn prim" data-accion="escaneoRespaldo">💾 Guardar respaldo y aplicar</button><button class="btn sec" data-accion="escaneoAplicar">Aplicar sin respaldo</button>' : '<button class="btn prim" data-accion="escaneoAplicar">Aplicar</button>'}
       <button class="btn sec" data-accion="cerrar">Ahora no</button></div>`);
   }
+  // Aplica lo encontrado. Las canciones entran AL INSTANTE con los datos del nombre del archivo;
+  // título, artista, categoría, género y año se leen de cada canción por detrás (completarDatos).
   async function aplicarEscaneo(dif, origen) {
-    const total = dif.nuevas.length + dif.modificadas.length;
-    let k = 0;
-    const av = () => { const t = $('#avTxt'); if (t) t.textContent = `Leyendo datos ${++k} de ${total}…`; };
-    if (origen !== 'auto') modal(`<h2>Aplicando…</h2><p id="avTxt"></p>`);
-    const recuperadas = [];
-    for (const [c, d] of dif.movidas) { c.ruta = d.ruta; c.carpeta = d.ruta.includes('/') ? d.ruta.split('/').slice(-2, -1)[0] : ''; c.mtime = d.mtime; await DB.poner('canciones', c); }
-    for (const [c, d] of dif.modificadas) {
-      const t = await Etiquetas.leerDatos(d.archivo); av();
-      for (const [campo] of CAMPOS_DATOS) if (!(c.editados && campo in c.editados) && t[campo]) c[campo] = t[campo];
-      c.tamano = d.tamano; c.mtime = d.mtime; c.modificada = ahora();
-      await DB.poner('canciones', c);
-    }
-    for (const d of dif.nuevas) {
-      const t = await Etiquetas.leerDatos(d.archivo); av();
-      const c = Object.assign({ id: 'c' + uid(), origen: 'carpeta', archivo: d.nombre, tamano: d.tamano, mtime: d.mtime, ruta: d.ruta,
-        carpeta: d.ruta.includes('/') ? d.ruta.split('/').slice(-2, -1)[0] : '', favorita: 0, calificacion: 0, alta: ahora() }, t);
+    const av = origen !== 'auto' ? ventanaAvance('➕ Agregando canciones', 'Entran ya con el nombre del archivo. Artista, categoría, género y año se completan solos por detrás.') : null;
+    const recuperadas = [], carpetaDe = r => r.includes('/') ? r.split('/').slice(-2, -1)[0] : '';
+    for (const [c, d] of dif.movidas) { c.ruta = d.ruta; c.carpeta = carpetaDe(d.ruta); c.mtime = d.mtime; }
+    if (dif.movidas.length) await DB.varios('canciones', dif.movidas.map(x => x[0]));
+    for (const [c, d] of dif.modificadas) { c.tamano = d.tamano; c.mtime = d.mtime; c.modificada = ahora(); c.pendienteDatos = 1; }
+    if (dif.modificadas.length) await DB.varios('canciones', dif.modificadas.map(x => x[0]));
+    let lote = [];
+    for (let i = 0; i < dif.nuevas.length; i++) {
+      const d = dif.nuevas[i], n = Etiquetas.desdeNombre(d.nombre);
+      const c = { id: 'c' + uid(), origen: 'carpeta', archivo: d.nombre, tamano: d.tamano, mtime: d.mtime, ruta: d.ruta, carpeta: carpetaDe(d.ruta),
+        titulo: n.titulo, artista: n.artista, album: '', genero: '', anio: '', favorita: 0, calificacion: 0, alta: ahora(), pendienteDatos: 1 };
       const m = aplicarMemoria(c);
       if (m) { recuperadas.push(c.titulo); await olvidarMemoria(m); }
-      await DB.poner('canciones', c); S.canciones.set(c.id, c);
+      S.canciones.set(c.id, c); lote.push(c);
+      if (lote.length >= 200 || i === dif.nuevas.length - 1) {
+        await DB.varios('canciones', lote); lote = [];
+        if (av) { av.texto(`➕ ${miles(i + 1)} de ${miles(dif.nuevas.length)} canciones`, ''); av.porcentaje((i + 1) / dif.nuevas.length * 100); }
+      }
     }
+    if (av) av.fin();
     if (dif.faltan.length) await quitarDeApp(dif.faltan.map(c => c.id), 'Ya no está en el teléfono', true);
     const fmt = c => `${c.titulo} — ${c.artista || 'Sin artista'}`;
     await anotar({ tipo: 'biblioteca', campo: 'escaneo', origen: origen === 'auto' ? 'automático' : 'manual',
       antes: `${miles(dif.totalApp)} canciones`, despues: `${miles([...S.canciones.values()].filter(c => c.origen === 'carpeta').length)} canciones`,
       detalle: { nuevas: dif.nuevas.map(d => d.nombre), recuperadas, modificadas: dif.modificadas.map(x => fmt(x[0])), movidas: dif.movidas.map(x => `${fmt(x[0])} → ${x[1].ruta}`), faltan: dif.faltan.map(fmt) } });
     cerrarModal();
-    toast(`🔍 +${dif.nuevas.length} nuevas · ${dif.modificadas.length} modificadas · ${dif.faltan.length} ya no están${recuperadas.length ? ` · ${recuperadas.length} recuperaron su trayectoria` : ''}`);
+    toast(`🔍 +${miles(dif.nuevas.length)} nuevas · ${dif.modificadas.length} modificadas · ${dif.faltan.length} ya no están${recuperadas.length ? ` · ${recuperadas.length} recuperaron su trayectoria` : ''}`);
+    if (dif.totalApp === 0 && dif.nuevas.length && location.hash !== '#/biblioteca') location.hash = '#/biblioteca';
     pintar();
+    completarDatos();
+  }
+
+  // Lee por detrás los datos internos (título, artista, categoría, género, año) de las canciones pendientes.
+  // Muestra una barrita arriba. Si la app se cierra, sigue la próxima vez donde iba. Nunca pisa lo que Edwin corrigió.
+  async function completarDatos() {
+    if (S.completando) return;
+    const pend = [...S.canciones.values()].filter(c => c.pendienteDatos);
+    if (!pend.length) return;
+    S.completando = true;
+    const barra = $('#fondo'), total = pend.length;
+    let hechas = 0, lote = [];
+    const mostrar = () => { if (barra) { barra.hidden = false; barra.innerHTML = `🏷️ Completando datos de tus canciones: <b>${miles(hechas)}</b> de ${miles(total)}<i style="width:${hechas / total * 100}%"></i>`; } };
+    mostrar();
+    try {
+      for (let i = 0; i < pend.length; i += 4) {
+        await Promise.all(pend.slice(i, i + 4).map(async c => {
+          try {
+            const t = await Etiquetas.leerDatos(await archivoDe(c));
+            for (const [campo] of CAMPOS_DATOS) if (!(c.editados && campo in c.editados) && t[campo]) c[campo] = t[campo];
+          } catch (e) {}
+          delete c.pendienteDatos; lote.push(c); hechas++;
+        }));
+        if (lote.length >= 40 || i + 4 >= pend.length) { await DB.varios('canciones', lote); lote = []; mostrar(); }
+        if (hechas % 400 === 0 && /biblioteca|listas|top/.test(location.hash)) pintar();
+      }
+    } finally {
+      S.completando = false;
+      if (barra) barra.hidden = true;
+      pintar();
+    }
   }
 
   // Cambia el código de una canción (al restaurar en un teléfono nuevo) sin perder nada de lo que cuelga de él
@@ -927,7 +999,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 3 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 4 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1152,6 +1224,7 @@
     },
     actualizarSi() { cerrarModal(); S._modo = 'actualizar'; $('#elegirCarpeta').click(); },
     conectarCarpeta, escanear() { escanear('manual'); },
+    cancelarEscaneo() { S.cancelar = true; const x = $('#avTxt'); if (x) x.textContent = 'Cancelando…'; },
     escaneoAplicar() { aplicarEscaneo(S._dif, 'manual'); },
     async escaneoRespaldo() { await guardarRespaldo('descargar'); await aplicarEscaneo(S._dif, 'manual'); },
     async permisoCarpeta() { if (await pedirPermiso()) { pintar(); escanear(S.config.autoEscaneo ? 'auto' : 'manual'); } else toast('Sin permiso no puedo leer tu carpeta', true); },
@@ -1231,6 +1304,7 @@
       if (!location.hash) location.hash = '#/sonando';
       pintar();
       if (S.carpeta && S.permiso && S.config.autoEscaneo) escanear('auto');
+      if (S.carpeta && S.permiso) completarDatos();   // si quedó a medias la vez anterior
     } catch (e) { vista.innerHTML = `<p class="mal">No se pudo abrir la base de datos: ${esc(e.message)}</p>`; }
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
       navigator.serviceWorker.register('sw.js').then(reg => {

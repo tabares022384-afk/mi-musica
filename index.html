@@ -167,6 +167,11 @@ details.sel input[type=search]{min-height:46px;margin-bottom:4px}
 .progreso-carga{height:12px;background:var(--panel2);border-radius:8px;overflow:hidden;margin:8px 0}
 .progreso-carga i{display:block;height:100%;background:var(--acento);width:0}
 #arranque{padding:40px 16px;text-align:center;color:var(--suave)}
+#fondo{position:sticky;top:calc(62px + env(safe-area-inset-top));z-index:4;background:var(--panel2);border-bottom:1px solid var(--linea);
+  padding:8px 14px 12px;font-size:.88rem;color:var(--suave)}
+#fondo b{color:var(--texto)}
+#fondo i{position:absolute;left:0;bottom:0;height:4px;background:var(--acento);transition:width .4s}
+body.carro #fondo{display:none!important}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -177,6 +182,7 @@ details.sel input[type=search]{min-height:46px;margin-bottom:4px}
   <button class="ico-btn" data-accion="modoCarro" aria-label="Modo carro">🚗</button>
 </header>
 <button class="btn prim" id="actualizar" data-accion="actualizarApp">🔄 Hay una versión nueva. Toca para actualizar</button>
+<div id="fondo" hidden></div>
 <main id="vista"><div id="arranque">Cargando…</div></main>
 <div id="mini" hidden></div>
 <nav class="abajo" id="nav">
