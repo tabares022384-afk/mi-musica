@@ -53,8 +53,25 @@
   const anioDe = c => ((c.anio || '').match(/\d{4}/) || [''])[0];
   const esCategoria = a => a && a === a.toUpperCase() && /[A-ZÁÉÍÓÚÑ]/.test(a);
   function toast(t, error) { const e = $('#toast'); e.textContent = t; e.className = 'ver' + (error ? ' error' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => e.className = '', 2600); }
-  function modal(html) { $('#modalHoja').innerHTML = html; $('#modal').classList.add('ver'); $('#modalHoja').scrollTop = 0; }
-  function cerrarModal() { $('#modal').classList.remove('ver'); }
+  // Ventanas: la flecha ATRÁS de Android cierra la ventana abierta (y no actúa sobre la pantalla de atrás).
+  // Al abrir una ventana se agrega un paso al historial; atrás lo consume y solo cierra la ventana.
+  let modalEnHistorial = false, cerrandoPorBoton = false;
+  function modal(html) {
+    $('#modalHoja').innerHTML = html; $('#modal').classList.add('ver'); $('#modalHoja').scrollTop = 0;
+    if (!modalEnHistorial) { try { history.pushState({ mmVentana: 1 }, ''); modalEnHistorial = true; } catch (e) {} }
+  }
+  function cerrarModal() {
+    $('#modal').classList.remove('ver');
+    if (!modalEnHistorial) return;
+    modalEnHistorial = false;
+    const h = location.hash;
+    // Se quita el paso de la ventana, salvo que el botón haya llevado a otra pantalla (eso no se deshace)
+    setTimeout(() => { if (location.hash === h && history.state && history.state.mmVentana && !modalEnHistorial) { cerrandoPorBoton = true; history.back(); } }, 0);
+  }
+  window.addEventListener('popstate', () => {
+    if (cerrandoPorBoton) { cerrandoPorBoton = false; return; }
+    if ($('#modal').classList.contains('ver')) { $('#modal').classList.remove('ver'); modalEnHistorial = false; }
+  });
   $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') cerrarModal(); });
 
   const total = c => S.escLocal.get(c.id) || { esc: 0, sal: 0, mes: 0, ultima: '' };
@@ -142,7 +159,7 @@
   async function archivoDe(c) {
     if (c.origen === 'carpeta') {
       if (!S.carpeta) throw new Error('No hay carpeta de música conectada');
-      if (!S.permiso) { S.permiso = (await S.carpeta.requestPermission({ mode: 'read' })) === 'granted'; if (!S.permiso) throw new Error('Falta el permiso para leer tu carpeta de música'); }
+      if (!S.permiso && !(await pedirPermiso())) throw new Error('Falta el permiso para leer tu carpeta de música');
       const k = (c.ruta || '').toLowerCase(), guardado = S._fh.get(k);
       if (guardado) { try { return await guardado.getFile(); } catch (e) { S._fh.delete(k); } }
       const partes = c.ruta.split('/');
@@ -550,10 +567,48 @@
     await anotar({ tipo: 'biblioteca', campo: 'carpeta', antes, despues: h.name });
     await escanear('manual');
   }
-  async function pedirPermiso() {
-    if (!S.carpeta) return false;
-    try { S.permiso = (await S.carpeta.requestPermission({ mode: 'read' })) === 'granted'; } catch (e) { S.permiso = false; }
-    return S.permiso;
+  // Android le quita a la app el permiso de la carpeta al cerrarla. Se vuelve a pedir SOLO con el primer toque
+  // en cualquier parte (un toque es lo que Android exige). Una sola petición a la vez.
+  let _pidiendo = null;
+  function pedirPermiso() {
+    if (!S.carpeta) return Promise.resolve(false);
+    if (S.permiso) return Promise.resolve(true);
+    if (_pidiendo) return _pidiendo;
+    _pidiendo = (async () => {
+      try { S.permiso = (await S.carpeta.requestPermission({ mode: 'read' })) === 'granted'; } catch (e) { S.permiso = false; }
+      _pidiendo = null;
+      if (S.permiso) alConectar();
+      return S.permiso;
+    })();
+    return _pidiendo;
+  }
+  // Apenas hay permiso: carga dónde está cada canción, completa géneros/años pendientes y revisa la carpeta
+  let _conectado = false;
+  function alConectar() {
+    if (_conectado) return; _conectado = true;
+    pintar();
+    cargarManijas().then(() => {
+      // La canción donde ibas queda lista: el primer ▶ suena de inmediato
+      const id = S.cola[Math.max(0, S.pos)], c = id && S.canciones.get(id);
+      if (c && !S.actual) archivoDe(c).then(f => { S._pre = { id, f }; }).catch(() => {});
+      if (S.config.autoEscaneo) escanear('auto');
+      completarDatos();
+    });
+  }
+  document.addEventListener('click', () => { if (S.carpeta && !S.permiso) pedirPermiso(); }, true);
+  // Dónde está cada canción (guardado en el teléfono): así no hay que buscarla carpeta por carpeta cada vez
+  async function cargarManijas() {
+    try {
+      const ms = await DB.todos('manijas');
+      for (const m of ms) if (!S._fh.has(m.k)) S._fh.set(m.k, m.h);
+      S._manijasGuardadas = new Set(ms.map(m => m.k));
+    } catch (e) { S._manijasGuardadas = new Set(); }
+  }
+  async function guardarManijas() {
+    const ya = S._manijasGuardadas || new Set(), nuevas = [];
+    for (const [k, h] of S._fh) if (!ya.has(k)) nuevas.push({ k, h });
+    for (let i = 0; i < nuevas.length; i += 300) { try { await DB.varios('manijas', nuevas.slice(i, i + 300)); } catch (e) { return; } }
+    nuevas.forEach(n => ya.add(n.k)); S._manijasGuardadas = ya;
   }
   // Recorre la carpeta. Muestra en vivo: carpeta actual, carpetas revisadas, canciones encontradas. Lee de a 12 a la vez.
   const CARPETAS_SALTAR = /^(android|\.thumbnails|thumbnails|cache|\.cache|lost\.dir|notifications|ringtones|alarms)$/i;
@@ -634,6 +689,7 @@
       });
       const dif = compararCarpeta(disco);
       S._dif = dif;
+      guardarManijas();
       await DB.guardarConfig('ultimoEscaneo', ahora()); S.ultimoEscaneo = ahora();
       if (av) av.fin();
       if (!dif.hayCambios) { if (modo === 'manual') { cerrarModal(); toast(dif.totalDisco ? `✅ Sin cambios · ${miles(dif.totalDisco)} canciones` : '⚠️ No encontré canciones en esa carpeta', !dif.totalDisco); } return; }
@@ -918,7 +974,7 @@
   const P = {};
   function avisoCarpeta() {
     if (!S.carpeta || S.permiso) return '';
-    return `<button class="btn sec" data-accion="permisoCarpeta" style="border-color:var(--aviso);margin-bottom:10px">🔓 Toca para volver a conectar tu carpeta «${esc(S.carpeta.name)}»</button>`;
+    return `<button class="btn sec" data-accion="permisoCarpeta" style="border-color:var(--aviso);margin-bottom:10px">🔓 Conectando tu carpeta «${esc(S.carpeta.name)}»… (si Android pregunta, toca Permitir)</button>`;
   }
   P.sonando = () => {
     if (!S.canciones.size) return avisoCarpeta() + bienvenida();
@@ -1091,6 +1147,9 @@
       <h2>📁 Mi carpeta de música</h2>
       ${puedeCarpeta() ? `<div class="caja"><p>Carpeta: <b>${S.carpeta ? esc(S.carpeta.name) : 'sin conectar'}</b>${S.carpeta && !S.permiso ? ' <span class="aviso">(falta permiso)</span>' : ''}</p>
         <p class="suave peq">Último escaneo: ${S.ultimoEscaneo ? fechaCorta(S.ultimoEscaneo) : 'nunca'} · ${miles([...S.canciones.values()].filter(c => c.origen === 'carpeta').length)} canciones leídas de la carpeta</p>
+        ${(() => { const t = [...S.canciones.values()], pend = t.filter(c => c.pendienteDatos).length, gen = t.filter(c => c.genero).length, an = t.filter(c => anioDe(c)).length, cat = t.filter(c => categoriaDe(c)).length;
+          return `<p class="peq">🏷️ Datos leídos de tus canciones: <b>${miles(t.length - pend)}</b> de ${miles(t.length)}${pend ? ' <span class="aviso">(completando…)</span>' : ' ✅'}</p>
+          <p class="suave peq">Con categoría: ${miles(cat)} · con género: ${miles(gen)} · con año: ${miles(an)}. Las que no tienen ese dato dentro del archivo salen como «sin género» / «sin año»; puedes corregirlas con ✏️.</p>`; })()}
         <label class="opcion"><input type="checkbox" data-ajuste="autoEscaneo"${S.config.autoEscaneo ? ' checked' : ''}> Escanear sola al abrir la app</label></div>
         <div class="botones">${S.carpeta ? '<button class="btn prim" data-accion="escanear">🔍 Escanear ahora</button>' : ''}
         <button class="btn sec" data-accion="conectarCarpeta">📁 ${S.carpeta ? 'Cambiar de carpeta' : 'Conectar mi carpeta de música'}</button></div>`
@@ -1110,7 +1169,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 5 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 6 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1381,7 +1440,7 @@
     cancelarEscaneo() { S.cancelar = true; const x = $('#avTxt'); if (x) x.textContent = 'Cancelando…'; },
     escaneoAplicar() { aplicarEscaneo(S._dif, 'manual'); },
     async escaneoRespaldo() { await guardarRespaldo('descargar'); await aplicarEscaneo(S._dif, 'manual'); },
-    async permisoCarpeta() { if (await pedirPermiso()) { pintar(); escanear(S.config.autoEscaneo ? 'auto' : 'manual'); } else toast('Sin permiso no puedo leer tu carpeta', true); },
+    async permisoCarpeta() { if (!(await pedirPermiso())) toast('Sin permiso no puedo leer tu carpeta', true); },
     flotante() { ventanaFlotante().catch(e => toast('⚠️ ' + e.message, true)); },
     respaldo() {
       modal(`<h2>💾 Guardar respaldo</h2><p class="suave">Guarda estatus, ❤, estrellas, escuchas, listas inteligentes, correcciones e historial. Las canciones no van dentro.</p>
@@ -1458,8 +1517,8 @@
       try { if (localStorage.getItem('mm-carro')) document.body.classList.add('carro'); } catch (e) {}
       if (!location.hash) location.hash = '#/sonando';
       pintar();
-      if (S.carpeta && S.permiso && S.config.autoEscaneo) escanear('auto');
-      if (S.carpeta && S.permiso) completarDatos();   // si quedó a medias la vez anterior
+      if (S.carpeta && S.permiso) alConectar();   // carga ubicaciones, completa datos pendientes y revisa la carpeta
+      else if (S.carpeta) cargarManijas();          // se dejan listas; el permiso llega con el primer toque
     } catch (e) { vista.innerHTML = `<p class="mal">No se pudo abrir la base de datos: ${esc(e.message)}</p>`; }
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
       navigator.serviceWorker.register('sw.js').then(reg => {

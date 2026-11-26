@@ -11,7 +11,7 @@
 //              (quitada o venida de un respaldo): al volver a agregarla recupera su estatus
 //   config     {clave, valor}
 (function () {
-  const NOMBRE = 'mi-musica-movil', VER = 2;
+  const NOMBRE = 'mi-musica-movil', VER = 3;   // v3: almacén «manijas» = dónde está cada canción en la carpeta (arranque rápido)
   let _db = null;
 
   function abrir() {
@@ -26,6 +26,7 @@
         if (!d.objectStoreNames.contains('cambios')) d.createObjectStore('cambios', { keyPath: 'n', autoIncrement: true });
         if (!d.objectStoreNames.contains('listas')) d.createObjectStore('listas', { keyPath: 'uid' });
         if (!d.objectStoreNames.contains('memoria')) d.createObjectStore('memoria', { keyPath: 'id' });
+        if (!d.objectStoreNames.contains('manijas')) d.createObjectStore('manijas', { keyPath: 'k' });
         if (d.objectStoreNames.contains('eventos')) d.deleteObjectStore('eventos');   // era para el PC (versión 1)
         if (!d.objectStoreNames.contains('config')) d.createObjectStore('config', { keyPath: 'clave' });
       };
