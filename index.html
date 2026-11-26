@@ -16,7 +16,9 @@
 --bien:#0f7d4c;--mal:#c62828;--aviso:#a35f00;--corazon:#d81b60;--estrella:#b07d00;color-scheme:light}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
-html{font-size:18px;-webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent}
+html{font-size:18px;-webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent;overscroll-behavior-y:none}
+/* Sin «bajar para recargar»: recargar hace que Android pida otra vez el permiso de la carpeta */
+body{overscroll-behavior-y:none}
 body{margin:0;background:var(--bg);color:var(--texto);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.35;
   padding-bottom:calc(160px + env(safe-area-inset-bottom));overflow-x:hidden}
 button,input,select,textarea{font:inherit;color:inherit}
