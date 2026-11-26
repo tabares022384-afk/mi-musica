@@ -17,28 +17,41 @@
   const limpiar = s => (s || '').replace(/\u0000+/g, ' ').replace(/﻿/g, '').trim();
   const genero = g => { const m = /^\((\d+)\)(.*)$/.exec(g); return m ? (m[2] || '').trim() : g; };
 
+  // Lee el ID3v2 cuadro por cuadro: solo baja los cuadros de texto y SALTA la carátula (que puede pesar varios MB).
   async function id3(f) {
     const h = await leer(f, 0, 10);
     if (h[0] !== 73 || h[1] !== 68 || h[2] !== 51) return null;
-    const ver = h[3], tam = (h[6] << 21) | (h[7] << 14) | (h[8] << 7) | h[9];
-    const b = await leer(f, 10, 10 + Math.min(tam, 4 * 1024 * 1024));
+    const ver = h[3], tam = (h[6] << 21) | (h[7] << 14) | (h[8] << 7) | h[9], fin = 10 + tam;
+    const corto = ver === 2, cab = corto ? 6 : 10;
     const out = {};
-    let i = 0;
-    if (h[5] & 0x40 && ver >= 3) i += ver === 4 ? ((b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]) : (4 + ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]));
-    const corto = ver === 2;
-    while (i + (corto ? 6 : 10) <= b.length) {
-      const idLen = corto ? 3 : 4;
-      const id = String.fromCharCode(...b.slice(i, i + idLen));
+    let pos = 10;
+    if (h[5] & 0x40 && ver >= 3) {
+      const e = await leer(f, 10, 14);
+      pos += ver === 4 ? ((e[0] << 21) | (e[1] << 14) | (e[2] << 7) | e[3]) : (4 + ((e[0] << 24) | (e[1] << 16) | (e[2] << 8) | e[3]));
+    }
+    // Ventana de lectura: se piden 64 KB a la vez; si un cuadro no interesa, se salta sin leerlo
+    let vIni = 0, v = new Uint8Array(0);
+    const asegurar = async (a, n) => { if (a < vIni || a + n > vIni + v.length) { vIni = a; v = await leer(f, a, Math.min(fin, a + Math.max(n, 65536))); } };
+    let vueltas = 0;
+    while (pos + cab <= fin && vueltas++ < 400) {
+      await asegurar(pos, cab);
+      const b = v, i = pos - vIni;
+      if (i + cab > b.length) break;
+      const id = String.fromCharCode(...b.slice(i, i + (corto ? 3 : 4)));
       if (!/^[A-Z0-9]+$/.test(id)) break;
       let n;
       if (corto) n = (b[i + 3] << 16) | (b[i + 4] << 8) | b[i + 5];
       else if (ver === 4) n = (b[i + 4] << 21) | (b[i + 5] << 14) | (b[i + 6] << 7) | b[i + 7];
       else n = ((b[i + 4] << 24) | (b[i + 5] << 16) | (b[i + 6] << 8) | b[i + 7]) >>> 0;
-      const ini = i + (corto ? 6 : 10);
-      if (n <= 0 || ini + n > b.length) break;
+      if (n <= 0 || pos + cab + n > fin) break;
       const campo = CAMPOS_ID3[id];
-      if (campo && !out[campo]) out[campo] = limpiar(texto(b.subarray(ini + 1, ini + n), b[ini]));
-      i = ini + n;
+      if (campo && !out[campo] && n < 65536) {
+        await asegurar(pos + cab, n);
+        const j = pos + cab - vIni;
+        out[campo] = limpiar(texto(v.subarray(j + 1, j + n), v[j]));
+      }
+      pos += cab + n;
+      if (out.titulo && out.artista && out.album && out.genero && out.anio) break;
     }
     if (out.genero) out.genero = genero(out.genero);
     if (out.anio) out.anio = out.anio.slice(0, 4);

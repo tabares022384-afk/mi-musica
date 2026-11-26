@@ -592,8 +592,24 @@
       const id = S.cola[Math.max(0, S.pos)], c = id && S.canciones.get(id);
       if (c && !S.actual) archivoDe(c).then(f => { S._pre = { id, f }; }).catch(() => {});
       if (S.config.autoEscaneo) escanear('auto');
-      completarDatos();
+      releerUnaVez().then(completarDatos);
     });
+  }
+  // Versión 7: las canciones que nunca se leyeron bien (versiones anteriores las marcaban como leídas aunque fallara)
+  // se vuelven a leer UNA vez. Nunca se pisa lo que Edwin corrigió a mano.
+  async function releerUnaVez() {
+    if (await DB.leerConfig('relectura7', false)) return;
+    const marcar = [...S.canciones.values()].filter(c => c.origen === 'carpeta' && !c.datosLeidos && !c.pendienteDatos);
+    marcar.forEach(c => { c.pendienteDatos = 1; });
+    for (let i = 0; i < marcar.length; i += 300) await DB.varios('canciones', marcar.slice(i, i + 300));
+    await DB.guardarConfig('relectura7', true);
+  }
+  async function releerTodas() {
+    const marcar = [...S.canciones.values()].filter(c => !c.pendienteDatos);
+    marcar.forEach(c => { c.pendienteDatos = 1; delete c.errorDatos; });
+    for (let i = 0; i < marcar.length; i += 300) await DB.varios('canciones', marcar.slice(i, i + 300));
+    toast(`🏷️ Leyendo otra vez los datos de ${miles(marcar.length)} canciones`);
+    completarDatos();
   }
   document.addEventListener('click', () => { if (S.carpeta && !S.permiso) pedirPermiso(); }, true);
   // Dónde está cada canción (guardado en el teléfono): así no hay que buscarla carpeta por carpeta cada vez
@@ -767,12 +783,17 @@
     mostrar();
     try {
       for (let i = 0; i < pend.length; i += 4) {
+        if (S.carpeta && !S.permiso && pend.slice(i, i + 4).some(c => c.origen === 'carpeta')) break;   // sin permiso: se sigue después, donde iba
         await Promise.all(pend.slice(i, i + 4).map(async c => {
           try {
             const t = await Etiquetas.leerDatos(await archivoDe(c));
             for (const [campo] of CAMPOS_DATOS) if (!(c.editados && campo in c.editados) && t[campo]) c[campo] = t[campo];
-          } catch (e) {}
-          delete c.pendienteDatos; lote.push(c); hechas++;
+            c.datosLeidos = 1; delete c.pendienteDatos; delete c.errorDatos;
+          } catch (e) {
+            // Solo se da por perdida si falla 3 veces (archivo dañado); si fue el permiso, queda pendiente
+            if (S.permiso || c.origen !== 'carpeta') { c.errorDatos = (c.errorDatos || 0) + 1; if (c.errorDatos >= 3) delete c.pendienteDatos; }
+          }
+          lote.push(c); hechas++;
         }));
         if (lote.length >= 40 || i + 4 >= pend.length) { await DB.varios('canciones', lote); lote = []; cambioDatos(); mostrar(); }
         if (hechas % 400 === 0 && /biblioteca|listas|top/.test(location.hash)) pintar();
@@ -1149,7 +1170,8 @@
         <p class="suave peq">Último escaneo: ${S.ultimoEscaneo ? fechaCorta(S.ultimoEscaneo) : 'nunca'} · ${miles([...S.canciones.values()].filter(c => c.origen === 'carpeta').length)} canciones leídas de la carpeta</p>
         ${(() => { const t = [...S.canciones.values()], pend = t.filter(c => c.pendienteDatos).length, gen = t.filter(c => c.genero).length, an = t.filter(c => anioDe(c)).length, cat = t.filter(c => categoriaDe(c)).length;
           return `<p class="peq">🏷️ Datos leídos de tus canciones: <b>${miles(t.length - pend)}</b> de ${miles(t.length)}${pend ? ' <span class="aviso">(completando…)</span>' : ' ✅'}</p>
-          <p class="suave peq">Con categoría: ${miles(cat)} · con género: ${miles(gen)} · con año: ${miles(an)}. Las que no tienen ese dato dentro del archivo salen como «sin género» / «sin año»; puedes corregirlas con ✏️.</p>`; })()}
+          <p class="suave peq">Con categoría: ${miles(cat)} · con género: ${miles(gen)} · con año: ${miles(an)}. Las que no tienen ese dato dentro del archivo salen como «sin género» / «sin año»; puedes corregirlas con ✏️.</p>
+          <button class="btn sec chico" data-accion="releerTodas" style="width:100%">🏷️ Volver a leer los datos de todas las canciones</button>`; })()}
         <label class="opcion"><input type="checkbox" data-ajuste="autoEscaneo"${S.config.autoEscaneo ? ' checked' : ''}> Escanear sola al abrir la app</label></div>
         <div class="botones">${S.carpeta ? '<button class="btn prim" data-accion="escanear">🔍 Escanear ahora</button>' : ''}
         <button class="btn sec" data-accion="conectarCarpeta">📁 ${S.carpeta ? 'Cambiar de carpeta' : 'Conectar mi carpeta de música'}</button></div>`
@@ -1169,7 +1191,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 6 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 7 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1218,7 +1240,12 @@
     const nombres = { categorias: 'Categoría', generos: 'Género', anios: 'Año', artistas: 'Artista', carpetas: 'Carpeta', estatus: 'Estatus' };
     const vals = valoresDe(campo), sel = S.filtros[campo];
     S._campoFiltro = campo;
-    modal(`<h2>${nombres[campo]}</h2><p class="suave peq">Toca una o varias: se aplica al instante.</p>
+    const conDato = vals.filter(([v]) => !String(v).startsWith('(sin')).length;
+    const pend = [...S.canciones.values()].filter(c => c.pendienteDatos).length;
+    const aviso = campo === 'estatus' || campo === 'carpetas' ? '' : !conDato
+      ? `<div class="caja aviso-c peq">Todavía no hay ${nombres[campo].toLowerCase()} leídos de tus canciones.${pend ? ` Se están leyendo ahora (faltan ${miles(pend)}); vuelve a abrir este filtro en un momento.` : ' Puedes pedir que se lean otra vez en Más › «🏷️ Volver a leer los datos».'}</div>`
+      : pend ? `<p class="aviso peq">Leyendo datos: faltan ${miles(pend)} canciones; la lista se completa sola.</p>` : '';
+    modal(`<h2>${nombres[campo]}</h2><p class="suave peq">Toca una o varias: se aplica al instante.</p>${aviso}
       <input type="search" class="buscaSel" placeholder="🔎 Buscar…" style="margin-bottom:6px">
       <div class="sel-opc" id="opcFiltro" style="max-height:52vh;overflow:auto">${vals.map(([v, n, t]) => `<label class="opcion" data-t="${esc(norm(t))}"><input type="checkbox" class="filtroVivo" value="${esc(v)}"${sel.includes(v) ? ' checked' : ''}> ${esc(t)} <small class="suave">${miles(n)}</small></label>`).join('')}</div>
       <div class="botones dos"><button class="btn sec" data-accion="filtroNinguno">🧹 Limpiar ${nombres[campo].toLowerCase()}</button><button class="btn prim" data-accion="cerrar" id="filtroListo">✔ Ver ${miles(filtrar().length)}</button></div>`);
@@ -1437,6 +1464,7 @@
     },
     actualizarSi() { cerrarModal(); S._modo = 'actualizar'; $('#elegirCarpeta').click(); },
     conectarCarpeta, escanear() { escanear('manual'); },
+    releerTodas() { releerTodas(); },
     cancelarEscaneo() { S.cancelar = true; const x = $('#avTxt'); if (x) x.textContent = 'Cancelando…'; },
     escaneoAplicar() { aplicarEscaneo(S._dif, 'manual'); },
     async escaneoRespaldo() { await guardarRespaldo('descargar'); await aplicarEscaneo(S._dif, 'manual'); },
