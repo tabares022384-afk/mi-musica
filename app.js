@@ -639,9 +639,18 @@
   }
   // Versión 7: las canciones que nunca se leyeron bien (versiones anteriores las marcaban como leídas aunque fallara)
   // se vuelven a leer UNA vez. Nunca se pisa lo que Edwin corrigió a mano.
+  const tieneDatos = c => !!(c.album || c.genero || c.anio);
   async function releerUnaVez() {
+    // Versión 9: la relectura de la v7 marcó TODAS las canciones. Las que ya tienen categoría, género o año
+    // quedan como leídas; solo se releen las que de verdad están vacías.
+    if (!(await DB.leerConfig('ajuste9', false))) {
+      const ya = [...S.canciones.values()].filter(c => c.pendienteDatos && !c.modificada && tieneDatos(c));
+      ya.forEach(c => { delete c.pendienteDatos; c.datosLeidos = 1; });
+      for (let i = 0; i < ya.length; i += 300) await DB.varios('canciones', ya.slice(i, i + 300));
+      await DB.guardarConfig('ajuste9', true);
+    }
     if (await DB.leerConfig('relectura7', false)) return;
-    const marcar = [...S.canciones.values()].filter(c => c.origen === 'carpeta' && !c.datosLeidos && !c.pendienteDatos);
+    const marcar = [...S.canciones.values()].filter(c => c.origen === 'carpeta' && !c.datosLeidos && !c.pendienteDatos && !tieneDatos(c));
     marcar.forEach(c => { c.pendienteDatos = 1; });
     for (let i = 0; i < marcar.length; i += 300) await DB.varios('canciones', marcar.slice(i, i + 300));
     await DB.guardarConfig('relectura7', true);
@@ -671,7 +680,9 @@
   // Recorre la carpeta. Muestra en vivo: carpeta actual, carpetas revisadas, canciones encontradas. Lee de a 12 a la vez.
   const CARPETAS_SALTAR = /^(android|\.thumbnails|thumbnails|cache|\.cache|lost\.dir|notifications|ringtones|alarms)$/i;
   // Recorre TODAS las carpetas conectadas. Lleva la cuenta por carpeta y de los audios que el teléfono no puede tocar.
-  async function leerDisco(avance) {
+  async function leerDisco(avance, completo) {
+    // Canciones ya conocidas (clave → tamaño/fecha). En revisión completa no se usa: se abre todo.
+    const conocidas = completo ? null : new Map([...S.canciones.values()].filter(c => c.origen === 'carpeta').map(c => [claveRuta(c.raiz, c.ruta), c]));
     const disco = new Map(), est = { carpetas: 0, canciones: 0, actual: '', porRaiz: {}, noReproduce: {}, saltadas: [], porSub: {},
       archivosVistos: 0, otrosTipos: {}, carpetasConError: [], fallos: [], noLeidos: [] };
     // Si una carpeta o un archivo da error, se anota y se SIGUE con el resto (antes se perdía en silencio).
@@ -703,9 +714,23 @@
         est.carpetasConError.push(nombreRaiz + (base ? '/' + base : '') + ' (' + (e.name || e.message) + ')');
         est.noLeidos.push(claveRuta(raiz, base ? base + '/' : ''));   // sus canciones no se dan por borradas
       }
-      for (let i = 0; i < archivos.length; i += 12) {
+      // RÁPIDO: una canción que la app ya conoce NO se abre (abrir 6.000 archivos en Android es lo lento).
+      // Solo se abren las nuevas. En «revisión completa» se abren todas para detectar archivos modificados.
+      const nuevos = [];
+      for (const a of archivos) {
+        const k = claveRuta(raiz, a[0]), c = conocidas && conocidas.get(k);
+        if (c) {
+          disco.set(k, { raiz, ruta: a[0], nombre: a[1], tamano: c.tamano, mtime: c.mtime, conocida: true });
+          S._fh.set(k, a[2]);
+          est.porRaiz[raiz] = (est.porRaiz[raiz] || 0) + 1;
+          const sub = nombreRaiz + (a[0].includes('/') ? '/' + a[0].split('/')[0] : '');
+          est.porSub[sub] = (est.porSub[sub] || 0) + 1;
+        } else nuevos.push(a);
+      }
+      est.canciones = disco.size; avance && avance(est);
+      for (let i = 0; i < nuevos.length; i += 12) {
         if (S.cancelar) throw new Error('cancelado');
-        await Promise.all(archivos.slice(i, i + 12).map(async ([ruta, nombre, h]) => {
+        await Promise.all(nuevos.slice(i, i + 12).map(async ([ruta, nombre, h]) => {
           const k = claveRuta(raiz, ruta);
           let f = null;
           for (let intento = 0; intento < 2 && !f; intento++) { try { f = await h.getFile(); } catch (e) { if (intento) { est.fallos.push(nombreRaiz + '/' + ruta); est.noLeidos.push(k); } } }
@@ -775,13 +800,16 @@
     if (S.escaneando || !S.carpeta) return;
     if (!S.permiso) { if (modo === 'auto') { pintar(); return; } if (!(await pedirPermiso())) return toast('Sin permiso no puedo leer tu carpeta', true); }
     S.escaneando = true;
+    const completo = modo === 'completo';
+    if (completo) modo = 'manual';
     let av = null, ultimo = 0;
     try {
-      if (modo === 'manual') av = ventanaAvance(`🔍 Leyendo ${S.raices.length > 1 ? `tus ${S.raices.length} carpetas` : `«${esc(S.carpeta.name)}»`}`, 'Solo se leen nombres y tamaños de las canciones. Puedes cancelar cuando quieras: no se pierde nada.');
+      if (modo === 'manual') av = ventanaAvance(`🔍 ${completo ? 'Revisión completa de' : 'Buscando cambios en'} ${S.raices.length > 1 ? `tus ${S.raices.length} carpetas` : `«${esc(S.carpeta.name)}»`}`,
+        completo ? 'Se abre cada archivo para ver si cambió. Tarda más; úsalo solo si editaste datos dentro de los archivos.' : 'Solo se buscan canciones nuevas y borradas: las que ya conoce no se abren. Puedes cancelar cuando quieras.');
       const disco = await leerDisco(est => {
         if (!av || Date.now() - ultimo < 250) return; ultimo = Date.now();
         av.texto(`🎵 ${miles(est.canciones)} canciones encontradas`, `📁 ${miles(est.carpetas)} carpetas revisadas · ahora en: ${est.actual}`);
-      });
+      }, completo);
       const dif = compararCarpeta(disco);
       S._dif = dif;
       guardarManijas();
@@ -864,16 +892,25 @@
     const pend = [...S.canciones.values()].filter(c => c.pendienteDatos);
     if (!pend.length) return;
     S.completando = true;
-    const barra = $('#fondo'), total = pend.length;
+    const barra = $('#fondo'), total = pend.length, inicio = Date.now();
     let hechas = 0, lote = [];
-    const mostrar = () => { if (barra) { barra.hidden = false; barra.innerHTML = `🏷️ Completando datos de tus canciones: <b>${miles(hechas)}</b> de ${miles(total)}<i style="width:${hechas / total * 100}%"></i>`; } };
+    const mostrar = (txt) => {
+      if (!barra) return;
+      barra.hidden = false;
+      const seg = hechas ? (Date.now() - inicio) / 1000 / hechas * (total - hechas) : 0;
+      const falta = !hechas ? 'calculando…' : seg < 60 ? 'menos de 1 min' : `unos ${Math.ceil(seg / 60)} min`;
+      barra.innerHTML = `🏷️ ${txt || 'Completando datos de tus canciones'}: <b>${miles(hechas)}</b> de ${miles(total)} · faltan ${falta}<i style="width:${Math.max(1, hechas / total * 100)}%"></i>`;
+    };
+    // Una canción que se queda «pegada» más de 12 s se salta (antes congelaba todo)
+    const conTiempo = (p, ms) => Promise.race([p, new Promise((_, mal) => setTimeout(() => mal(new Error('tardó demasiado')), ms))]);
     mostrar();
     try {
-      for (let i = 0; i < pend.length; i += 4) {
-        if (S.carpeta && !S.permiso && pend.slice(i, i + 4).some(c => c.origen === 'carpeta')) break;   // sin permiso: se sigue después, donde iba
-        await Promise.all(pend.slice(i, i + 4).map(async c => {
+      while (S.escaneando) { mostrar('Esperando a que termine el escaneo'); await new Promise(r => setTimeout(r, 1000)); }
+      for (let i = 0; i < pend.length; i += 6) {
+        if (S.carpeta && !S.permiso && pend.slice(i, i + 6).some(c => c.origen === 'carpeta')) break;   // sin permiso: se sigue después, donde iba
+        await Promise.all(pend.slice(i, i + 6).map(async c => {
           try {
-            const t = await Etiquetas.leerDatos(await archivoDe(c));
+            const t = await conTiempo(archivoDe(c).then(f => Etiquetas.leerDatos(f)), 12000);
             for (const [campo] of CAMPOS_DATOS) if (!(c.editados && campo in c.editados) && t[campo]) c[campo] = t[campo];
             c.datosLeidos = 1; delete c.pendienteDatos; delete c.errorDatos;
           } catch (e) {
@@ -882,13 +919,16 @@
           }
           lote.push(c); hechas++;
         }));
-        if (lote.length >= 40 || i + 4 >= pend.length) { await DB.varios('canciones', lote); lote = []; cambioDatos(); mostrar(); }
+        mostrar();   // la barrita avanza con cada grupo de 6
+        if (lote.length >= 30 || i + 6 >= pend.length) { await DB.varios('canciones', lote); lote = []; cambioDatos(); }
         if (hechas % 400 === 0 && /biblioteca|listas|top/.test(location.hash)) pintar();
       }
     } finally {
       S.completando = false;
       if (barra) barra.hidden = true;
       pintar();
+      // Si mientras tanto llegaron canciones nuevas (otro escaneo), se siguen con ellas
+      if (S.permiso && [...S.canciones.values()].some(c => c.pendienteDatos && (c.errorDatos || 0) < 3 && !pend.includes(c))) setTimeout(completarDatos, 500);
     }
   }
 
@@ -1281,7 +1321,7 @@
           <p class="suave peq">Con categoría: ${miles(cat)} · con género: ${miles(gen)} · con año: ${miles(an)}. Las que no tienen ese dato dentro del archivo salen como «sin género» / «sin año»; puedes corregirlas con ✏️.</p>
           <button class="btn sec chico" data-accion="releerTodas" style="width:100%">🏷️ Volver a leer los datos de todas las canciones</button>`; })()}
         <label class="opcion"><input type="checkbox" data-ajuste="autoEscaneo"${S.config.autoEscaneo ? ' checked' : ''}> Escanear sola al abrir la app</label></div>
-        <div class="botones">${S.carpeta ? '<button class="btn prim" data-accion="escanear">🔍 Escanear ahora</button>' : ''}
+        <div class="botones">${S.carpeta ? '<button class="btn prim" data-accion="escanear">🔍 Buscar canciones nuevas o borradas</button><button class="btn sec chico" data-accion="escanearCompleto" style="width:100%">🔬 Revisión completa (si editaste datos dentro de los archivos)</button>' : ''}
         </div>`
       : '<p class="suave peq">Este teléfono no deja conectar una carpeta. Las canciones se copian dentro de la app.</p>'}
       <details class="sel"><summary><b>Copiar canciones dentro de la app</b> <span class="suave">(opción de respaldo)</span></summary><div class="botones">
@@ -1299,7 +1339,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 8 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 9 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1571,7 +1611,7 @@
         <div class="botones"><button class="btn prim" data-accion="actualizarSi">📁 Elegir la carpeta</button><button class="btn sec" data-accion="cerrar">Cancelar</button></div>`);
     },
     actualizarSi() { cerrarModal(); S._modo = 'actualizar'; $('#elegirCarpeta').click(); },
-    conectarCarpeta, escanear() { escanear('manual'); },
+    conectarCarpeta, escanear() { escanear('manual'); }, escanearCompleto() { escanear('completo'); },
     releerTodas() { releerTodas(); },
     quitarCarpeta(b) { quitarCarpeta(b.dataset.id); },
     quitarCarpetaSi(b) { quitarCarpetaSi(b.dataset.id); },
