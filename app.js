@@ -516,6 +516,7 @@
         if (f.webkitRelativePath && c.ruta !== ruta) { c.ruta = ruta; c.carpeta = carpeta; await DB.poner('canciones', c); }
       } else {
         const d = await Etiquetas.leerDatos(f);
+        d.tipoEtiqueta = d._tipo; delete d._tipo; delete d._error;
         const c = Object.assign({ id, archivo: f.name, tamano: f.size, ruta, carpeta, favorita: 0, calificacion: 0, alta: ahora() }, d);
         const m = aplicarMemoria(c);
         if (m) recuperadas.push(c.titulo);
@@ -641,6 +642,16 @@
   // se vuelven a leer UNA vez. Nunca se pisa lo que Edwin corrigió a mano.
   const tieneDatos = c => !!(c.album || c.genero || c.anio);
   async function releerUnaVez() {
+    // Versión 10: el lector nuevo entiende géneros por número, ID3v1, FLAC y OGG. Se releen UNA vez solo las canciones
+    // que quedaron sin género (las que tienen género corregido a mano no se tocan).
+    if (!(await DB.leerConfig('ajuste10', false))) {
+      const sin = [...S.canciones.values()].filter(c => !c.genero && !(c.editados && 'genero' in c.editados) && !c.pendienteDatos);
+      sin.forEach(c => { c.pendienteDatos = 1; delete c.errorDatos; });
+      for (let i = 0; i < sin.length; i += 300) await DB.varios('canciones', sin.slice(i, i + 300));
+      await DB.guardarConfig('ajuste10', true);
+      await DB.guardarConfig('ajuste9', true); await DB.guardarConfig('relectura7', true);
+      return;
+    }
     // Versión 9: la relectura de la v7 marcó TODAS las canciones. Las que ya tienen categoría, género o año
     // quedan como leídas; solo se releen las que de verdad están vacías.
     if (!(await DB.leerConfig('ajuste9', false))) {
@@ -912,7 +923,7 @@
           try {
             const t = await conTiempo(archivoDe(c).then(f => Etiquetas.leerDatos(f)), 12000);
             for (const [campo] of CAMPOS_DATOS) if (!(c.editados && campo in c.editados) && t[campo]) c[campo] = t[campo];
-            c.datosLeidos = 1; delete c.pendienteDatos; delete c.errorDatos;
+            c.tipoEtiqueta = t._tipo; c.datosLeidos = 2; delete c.pendienteDatos; delete c.errorDatos;
           } catch (e) {
             // Solo se da por perdida si falla 3 veces (archivo dañado); si fue el permiso, queda pendiente
             if (S.permiso || c.origen !== 'carpeta') { c.errorDatos = (c.errorDatos || 0) + 1; if (c.errorDatos >= 3) delete c.pendienteDatos; }
@@ -1120,6 +1131,29 @@
 
   // ---------------------------------------------------------------- pantallas
   const P = {};
+  // Diagnóstico en texto para pegar en el chat: qué tipos de archivo y de datos internos hay, y ejemplos de los que fallan
+  function diagnosticoTexto() {
+    const t = [...S.canciones.values()], cuenta = (arr, f) => { const m = {}; arr.forEach(x => { const k = f(x); m[k] = (m[k] || 0) + 1; }); return Object.entries(m).sort((a, b) => b[1] - a[1]); };
+    const ext = c => ((c.archivo || '').split('.').pop() || '?').toLowerCase();
+    const sinGen = t.filter(c => !c.genero), sinCat = t.filter(c => !c.album);
+    const L = [];
+    L.push(`MI MÚSICA — DIAGNÓSTICO ${ahora()} · versión ${(document.body.innerText.match(/versión (\d+)/) || [])[1] || '?'}`);
+    L.push(`Canciones: ${t.length} · de carpeta: ${t.filter(c => c.origen === 'carpeta').length} · copiadas: ${t.filter(c => c.origen !== 'carpeta').length}`);
+    L.push(`Carpetas: ${S.raices.map(r => `${r.h.name}${r.ok ? '' : ' (sin permiso)'}`).join(', ') || 'ninguna'} · permiso: ${S.permiso ? 'sí' : 'no'}`);
+    L.push(`Con género: ${t.length - sinGen.length} · sin género: ${sinGen.length} · con categoría: ${t.length - sinCat.length} · con año: ${t.filter(c => anioDe(c)).length}`);
+    L.push(`Pendientes de leer: ${t.filter(c => c.pendienteDatos).length} · con error al leer: ${t.filter(c => c.errorDatos).length}`);
+    L.push(`Tipos de archivo: ${cuenta(t, ext).map(([k, n]) => `${k} ${n}`).join(', ')}`);
+    L.push(`Datos internos: ${cuenta(t, c => c.tipoEtiqueta || 'sin leer con v10').map(([k, n]) => `${k} ${n}`).join(', ')}`);
+    L.push(`Sin género por tipo de archivo: ${cuenta(sinGen, ext).map(([k, n]) => `${k} ${n}`).join(', ')}`);
+    L.push(`Sin género por datos internos: ${cuenta(sinGen, c => c.tipoEtiqueta || 'sin leer con v10').map(([k, n]) => `${k} ${n}`).join(', ')}`);
+    L.push(`Géneros más comunes: ${valoresDe('generos').slice(0, 15).map(([v, n]) => `${v} ${n}`).join(', ')}`);
+    L.push(`Categorías más comunes: ${valoresDe('categorias').slice(0, 15).map(([v, n]) => `${v} ${n}`).join(', ')}`);
+    L.push('Ejemplos sin género:');
+    sinGen.slice(0, 15).forEach(c => L.push(`  - ${c.ruta || c.archivo} | ${c.tipoEtiqueta || '?'} | ${c.artista || ''} | cat:${c.album || ''}`));
+    const I = S.informe;
+    if (I) L.push(`Último escaneo ${I.fecha}: ${I.carpetasRevisadas} carpetas, ${I.archivosVistos || '?'} archivos vistos, ${I.total} canciones, carpetas con error: ${(I.carpetasConError || []).length}, ilegibles: ${I.fallos || 0}, otros tipos: ${(I.otrosTipos || []).map(([x, n]) => `${x} ${n}`).join(', ')}, no reproducibles: ${Object.entries(I.noReproduce || {}).map(([x, n]) => `${x} ${n}`).join(', ')}`);
+    return L.join('\n');
+  }
   // Informe del último escaneo: dónde encontró canciones y qué no pudo usar
   function informeHtml() {
     const I = S.informe; if (!I) return '';
@@ -1319,7 +1353,8 @@
         ${(() => { const t = [...S.canciones.values()], pend = t.filter(c => c.pendienteDatos).length, gen = t.filter(c => c.genero).length, an = t.filter(c => anioDe(c)).length, cat = t.filter(c => categoriaDe(c)).length;
           return `<p class="peq">🏷️ Datos leídos de tus canciones: <b>${miles(t.length - pend)}</b> de ${miles(t.length)}${pend ? ' <span class="aviso">(completando…)</span>' : ' ✅'}</p>
           <p class="suave peq">Con categoría: ${miles(cat)} · con género: ${miles(gen)} · con año: ${miles(an)}. Las que no tienen ese dato dentro del archivo salen como «sin género» / «sin año»; puedes corregirlas con ✏️.</p>
-          <button class="btn sec chico" data-accion="releerTodas" style="width:100%">🏷️ Volver a leer los datos de todas las canciones</button>`; })()}
+          <button class="btn sec chico" data-accion="releerTodas" style="width:100%">🏷️ Volver a leer los datos de todas las canciones</button>
+          <button class="btn sec chico" data-accion="diagnostico" style="width:100%;margin-top:8px">📋 Diagnóstico (copiar para enviar a Claude)</button>`; })()}
         <label class="opcion"><input type="checkbox" data-ajuste="autoEscaneo"${S.config.autoEscaneo ? ' checked' : ''}> Escanear sola al abrir la app</label></div>
         <div class="botones">${S.carpeta ? '<button class="btn prim" data-accion="escanear">🔍 Buscar canciones nuevas o borradas</button><button class="btn sec chico" data-accion="escanearCompleto" style="width:100%">🔬 Revisión completa (si editaste datos dentro de los archivos)</button>' : ''}
         </div>`
@@ -1339,7 +1374,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 9 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 10 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1613,6 +1648,15 @@
     actualizarSi() { cerrarModal(); S._modo = 'actualizar'; $('#elegirCarpeta').click(); },
     conectarCarpeta, escanear() { escanear('manual'); }, escanearCompleto() { escanear('completo'); },
     releerTodas() { releerTodas(); },
+    async diagnostico() {
+      const t = diagnosticoTexto();
+      let copiado = false;
+      try { await navigator.clipboard.writeText(t); copiado = true; } catch (e) {}
+      modal(`<h2>📋 Diagnóstico</h2><p class="suave peq">${copiado ? '✅ Ya quedó copiado: pégalo en el chat con Claude.' : 'Mantén presionado el texto, «Seleccionar todo» y «Copiar», y pégalo en el chat con Claude.'}</p>
+        <textarea readonly style="min-height:50vh;font-size:.8rem;font-family:monospace">${esc(t)}</textarea>
+        <div class="botones">${navigator.share ? '<button class="btn sec" data-accion="diagnosticoCompartir">📲 Compartir (WhatsApp, correo…)</button>' : ''}<button class="btn sec" data-accion="cerrar">Cerrar</button></div>`);
+    },
+    async diagnosticoCompartir() { try { await navigator.share({ title: 'Diagnóstico Mi Música', text: diagnosticoTexto() }); } catch (e) {} },
     quitarCarpeta(b) { quitarCarpeta(b.dataset.id); },
     quitarCarpetaSi(b) { quitarCarpetaSi(b.dataset.id); },
     cancelarEscaneo() { S.cancelar = true; const x = $('#avTxt'); if (x) x.textContent = 'Cancelando…'; },
