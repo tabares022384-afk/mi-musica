@@ -63,6 +63,7 @@
   async function cargar() {
     const [cs, ls, es, cm, me] = await Promise.all([DB.todos('canciones'), DB.todos('listas'), DB.todos('escuchas'), DB.todos('cambios'), DB.todos('memoria')]);
     S.canciones = new Map(cs.map(c => [c.id, c]));
+    if (typeof cambioDatos === 'function') cambioDatos();
     S.listas = new Map(ls.map(l => [l.uid, l]));
     S.memoria = new Map(me.map(m => [m.id, m]));
     S.cambios = cm;
@@ -103,6 +104,8 @@
     c[campo] = valor;
     if (!['favorita', 'calificacion'].includes(campo)) { c.editados = c.editados || {}; c.editados[campo] = valor; }
     await DB.poner('canciones', c);
+    cambioDatos();
+    if (S.actual && S.actual.id === c.id) sesionMedios(c);   // la tarjeta de notificaciones muestra el nuevo estatus
     await anotar({ cancion: c, tipo: ['favorita', 'calificacion'].includes(campo) ? 'estatus' : 'datos', campo, antes, despues: valor, deshacible: origen !== 'deshacer', origen: origen || 'manual' });
     return true;
   }
@@ -124,15 +127,30 @@
   }
 
   // ---------------------------------------------------------------- reproductor
+  // RAPIDEZ: la app recuerda dónde está cada canción y cada carpeta (S._fh / S._dirs) para no buscarlas cada vez.
+  S._fh = new Map(); S._dirs = new Map();
+  async function carpetaDe(partes) {
+    let d = S.carpeta, camino = '';
+    for (const p of partes) {
+      camino = camino ? camino + '/' + p : p;
+      let h = S._dirs.get(camino.toLowerCase());
+      if (!h) { h = await d.getDirectoryHandle(p); S._dirs.set(camino.toLowerCase(), h); }
+      d = h;
+    }
+    return d;
+  }
   async function archivoDe(c) {
     if (c.origen === 'carpeta') {
       if (!S.carpeta) throw new Error('No hay carpeta de música conectada');
       if (!S.permiso) { S.permiso = (await S.carpeta.requestPermission({ mode: 'read' })) === 'granted'; if (!S.permiso) throw new Error('Falta el permiso para leer tu carpeta de música'); }
-      let d = S.carpeta; const partes = c.ruta.split('/');
+      const k = (c.ruta || '').toLowerCase(), guardado = S._fh.get(k);
+      if (guardado) { try { return await guardado.getFile(); } catch (e) { S._fh.delete(k); } }
+      const partes = c.ruta.split('/');
       try {
-        for (const p of partes.slice(0, -1)) d = await d.getDirectoryHandle(p);
-        return await (await d.getFileHandle(partes[partes.length - 1])).getFile();
-      } catch (e) { throw new Error('Esa canción ya no está en el teléfono. Toca 🔍 Escanear.'); }
+        const fh = await (await carpetaDe(partes.slice(0, -1))).getFileHandle(partes[partes.length - 1]);
+        S._fh.set(k, fh);
+        return await fh.getFile();
+      } catch (e) { S._dirs.clear(); throw new Error('Esa canción ya no está en el teléfono. Toca 🔍 Escanear.'); }
     }
     const a = await DB.uno('archivos', c.id);
     if (!a) throw new Error('La canción ya no está guardada en la app');
@@ -148,6 +166,13 @@
     const e = { uuid: uid(), cancionId: c.id, fecha: ahora(), segundos: Math.round(seg * 10) / 10, clase };
     DB.poner('escuchas', e);
     sumarEscucha(e, e.fecha.slice(0, 7));
+    cambioDatos();
+  }
+  // Deja lista la siguiente canción mientras suena la actual: el cambio es inmediato
+  function prepararSiguiente() {
+    const id = S.cola[S.pos + 1], c = id && S.canciones.get(id);
+    if (!c || (S._pre && S._pre.id === id)) return;
+    archivoDe(c).then(f => { S._pre = { id, f }; }).catch(() => {});
   }
   async function sonar(pos, desde) {
     if (pos < 0 || pos >= S.cola.length) return;
@@ -156,8 +181,10 @@
     const c = S.canciones.get(S.cola[pos]);
     if (!c) return siguiente();
     S.actual = c;
+    refrescarSonando();   // la pantalla cambia al instante, antes de cargar el archivo
     try {
-      const f = await archivoDe(c);
+      const f = (S._pre && S._pre.id === c.id) ? S._pre.f : await archivoDe(c);
+      S._pre = null;
       if (S.url) URL.revokeObjectURL(S.url);
       S.url = URL.createObjectURL(f);
       audio.src = S.url;
@@ -165,7 +192,16 @@
       S.ultimoT = desde || 0;
       await audio.play().catch(() => {});
     } catch (e) { toast('⚠️ ' + e.message, true); return setTimeout(() => siguiente(true), 800); }
-    sesionMedios(c); guardarEstado(); pintar();
+    sesionMedios(c); guardarEstado();
+    setTimeout(prepararSiguiente, 1500);
+  }
+  // Al cambiar de canción NO se redibuja toda la pantalla: solo «Sonando» (si está abierta), la mini barra y la canción marcada
+  function refrescarSonando() {
+    const ruta = (location.hash || '#/sonando').split('/')[1] || 'sonando';
+    if (ruta === 'sonando') { pintar(); return; }
+    pintarMini();
+    document.querySelectorAll('.cancion.sonando').forEach(e => e.classList.remove('sonando'));
+    if (S.actual) document.querySelectorAll('.cancion[data-id]').forEach(e => { if (e.dataset.id === S.actual.id) e.classList.add('sonando'); });
   }
   function siguiente(auto) {
     if (!S.cola.length) return;
@@ -196,18 +232,47 @@
     const c = S.actual;
     if (c && audio.duration && Math.abs((c.duracion || 0) - audio.duration) > 1) { c.duracion = Math.round(audio.duration * 10) / 10; DB.poner('canciones', c); }
   });
+  // Tarjeta del panel de notificaciones y de la pantalla bloqueada: título, artista, categoría, carátula y barra de avance.
+  // Los botones ⏮ ⏯ ⏭ de esa tarjeta (y los del volante o Bluetooth) mueven la app aunque esté en segundo plano.
+  const _caratulas = new Map();
+  function caratula(c) {
+    const clave = (categoriaDe(c) || c.artista || '') + '|' + iniciales(c) + '|' + puntos(c);
+    if (_caratulas.has(clave)) return _caratulas.get(clave);
+    try {
+      const cv = document.createElement('canvas'); cv.width = cv.height = 512; const x = cv.getContext('2d');
+      x.fillStyle = color(categoriaDe(c) || c.artista || 'Mi Música'); x.fillRect(0, 0, 512, 512);
+      x.fillStyle = '#fff'; x.textAlign = 'center'; x.textBaseline = 'middle';
+      x.font = 'bold 200px system-ui, sans-serif'; x.fillText(iniciales(c), 256, 230);
+      x.font = 'bold 52px system-ui, sans-serif'; x.fillText(('★'.repeat(c.calificacion || 0) + (c.favorita ? ' ❤' : '')) || '♪', 256, 400);
+      const url = cv.toDataURL('image/png');
+      if (_caratulas.size > 60) _caratulas.clear();
+      _caratulas.set(clave, url); return url;
+    } catch (e) { return 'icono-512.png'; }
+  }
   function sesionMedios(c) {
     if (!('mediaSession' in navigator)) return;
     navigator.mediaSession.metadata = new MediaMetadata({ title: c.titulo || c.archivo, artist: c.artista || '', album: categoriaDe(c) || c.carpeta || '',
-      artwork: [{ src: 'icono-512.png', sizes: '512x512', type: 'image/png' }] });
+      artwork: [{ src: caratula(c), sizes: '512x512', type: 'image/png' }] });
+    posicionMedios();
   }
+  function posicionMedios() {
+    try {
+      if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState || !audio.duration || !isFinite(audio.duration)) return;
+      navigator.mediaSession.setPositionState({ duration: audio.duration, playbackRate: audio.playbackRate || 1, position: Math.min(audio.currentTime, audio.duration) });
+    } catch (e) {}
+  }
+  audio.addEventListener('loadedmetadata', posicionMedios);
+  audio.addEventListener('seeked', posicionMedios);
+  audio.addEventListener('play', posicionMedios);
   if ('mediaSession' in navigator) {
     const ms = navigator.mediaSession;
     ms.setActionHandler('play', () => playPausa());
     ms.setActionHandler('pause', () => audio.pause());
     ms.setActionHandler('nexttrack', () => siguiente());
     ms.setActionHandler('previoustrack', () => anterior());
-    try { ms.setActionHandler('seekto', e => { audio.currentTime = e.seekTime; }); } catch (e) {}
+    try { ms.setActionHandler('seekto', e => { audio.currentTime = e.seekTime; posicionMedios(); }); } catch (e) {}
+    try { ms.setActionHandler('seekforward', () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 10); posicionMedios(); }); } catch (e) {}
+    try { ms.setActionHandler('seekbackward', () => { audio.currentTime = Math.max(0, audio.currentTime - 10); posicionMedios(); }); } catch (e) {}
     try { ms.setActionHandler('enterpictureinpicture', () => ventanaFlotante().catch(() => {})); } catch (e) {}
   }
   audio.addEventListener('play', () => { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'; });
@@ -266,40 +331,69 @@
     categorias: c => categoriaDe(c) || '(sin categoría)', generos: c => c.genero || '(sin género)', anios: c => anioDe(c) || '(sin año)',
     artistas: c => c.artista || '(sin artista)', carpetas: c => c.carpeta || '(sin carpeta)', estatus: c => estatusDe(c).clave,
   };
+  // Texto de búsqueda de cada canción, guardado aparte para que buscar sea instantáneo (se rehace si cambian sus datos)
+  const _textos = new WeakMap();
+  const textoBusqueda = c => {
+    const firma = `${c.titulo}|${c.artista}|${c.album}|${c.genero}|${c.anio}`;
+    const t = _textos.get(c);
+    if (t && t[0] === firma) return t[1];
+    const n = norm(`${c.titulo} ${c.artista} ${c.album} ${c.genero} ${c.anio} ${c.archivo}`);
+    _textos.set(c, [firma, n]); return n;
+  };
+  const CAMPOS_FILTRO = ['categorias', 'generos', 'anios', 'artistas', 'carpetas', 'estatus'];
+  function cumple(c, F, q) {
+    for (const k of CAMPOS_FILTRO) if (F[k] && F[k].length && !F[k].includes(OBT[k](c))) return false;
+    if (q.length) { const t = textoBusqueda(c); if (!q.every(p => t.includes(p))) return false; }
+    return true;
+  }
+  // RAPIDEZ: los cálculos pesados (filtrar, ordenar, contar categorías) se guardan y se reutilizan hasta que algo cambie.
+  // cambioDatos() avisa que algo cambió (estrellas, ❤, escuchas, canciones nuevas, datos completados…).
+  let _version = 0;
+  const _memo = new Map();
+  function cambioDatos() { _version++; _memo.clear(); }
+  function recordar(clave, calcular) {
+    const k = clave + '|' + _version + '|' + S.canciones.size;
+    if (_memo.has(k)) return _memo.get(k);
+    const v = calcular(); if (_memo.size > 40) _memo.clear(); _memo.set(k, v); return v;
+  }
+  const COMPARAR = new Intl.Collator('es', { sensitivity: 'base', numeric: true }).compare;   // mucho más rápido que localeCompare
   function filtrar() {
-    const F = S.filtros, q = norm(F.q).split(/\s+/).filter(Boolean);
-    let r = [...S.canciones.values()].filter(c => {
-      for (const k of ['categorias', 'generos', 'anios', 'artistas', 'carpetas', 'estatus']) if (F[k].length && !F[k].includes(OBT[k](c))) return false;
-      if (q.length) { const t = norm(`${c.titulo} ${c.artista} ${c.album} ${c.genero} ${c.anio} ${c.archivo}`); if (!q.every(p => t.includes(p))) return false; }
-      return true;
+    const F = S.filtros;
+    return recordar('filtrar:' + JSON.stringify(F), () => {
+      const q = norm(F.q).split(/\s+/).filter(Boolean);
+      return ordenar([...S.canciones.values()].filter(c => cumple(c, F, q)), F.orden);
     });
-    return ordenar(r, F.orden);
   }
   function ordenar(r, o) {
     if (o === 'escuchas') r.sort((a, b) => total(b).esc - total(a).esc);
     else if (o === 'estatus') r.sort((a, b) => puntos(b) - puntos(a) || total(b).esc - total(a).esc);
-    else if (o === 'recientes') r.sort((a, b) => (b.alta || '').localeCompare(a.alta || ''));
-    else if (o === 'anio') r.sort((a, b) => (anioDe(b) || '0').localeCompare(anioDe(a) || '0'));
-    else if (o === 'anioAsc') r.sort((a, b) => (anioDe(a) || '9999').localeCompare(anioDe(b) || '9999'));
-    else if (o === 'artista') r.sort((a, b) => (a.artista || '').localeCompare(b.artista || '', 'es') || (a.titulo || '').localeCompare(b.titulo || '', 'es'));
+    else if (o === 'recientes') r.sort((a, b) => (a.alta || '') < (b.alta || '') ? 1 : (a.alta || '') > (b.alta || '') ? -1 : 0);
+    else if (o === 'anio') r.sort((a, b) => (+anioDe(b) || 0) - (+anioDe(a) || 0));
+    else if (o === 'anioAsc') r.sort((a, b) => (+anioDe(a) || 9999) - (+anioDe(b) || 9999));
+    else if (o === 'artista') r.sort((a, b) => COMPARAR(a.artista || '', b.artista || '') || COMPARAR(a.titulo || '', b.titulo || ''));
     else if (o === 'azar') r = r.map(c => [Math.random(), c]).sort((a, b) => a[0] - b[0]).map(x => x[1]);
-    else r.sort((a, b) => (a.titulo || '').localeCompare(b.titulo || '', 'es'));
+    else r.sort((a, b) => COMPARAR(a.titulo || '', b.titulo || ''));
     return r;
   }
   function valoresDe(campo) {
-    if (campo === 'estatus') return ESTATUS.map(e => [e.clave, [...S.canciones.values()].filter(c => estatusDe(c).clave === e.clave).length, e.nombre]);
-    const m = new Map();
-    for (const c of S.canciones.values()) { const v = OBT[campo](c); m.set(v, (m.get(v) || 0) + 1); }
-    const r = [...m.entries()].map(([v, n]) => [v, n, v]);
-    return campo === 'anios' ? r.sort((a, b) => b[0].localeCompare(a[0])) : r.sort((a, b) => b[1] - a[1]);
+    return recordar('valores:' + campo, () => {
+      if (campo === 'estatus') { const n = {}; for (const c of S.canciones.values()) { const k = estatusDe(c).clave; n[k] = (n[k] || 0) + 1; } return ESTATUS.map(e => [e.clave, n[e.clave] || 0, e.nombre]); }
+      const m = new Map();
+      for (const c of S.canciones.values()) { const v = OBT[campo](c); m.set(v, (m.get(v) || 0) + 1); }
+      const r = [...m.entries()].map(([v, n]) => [v, n, v]);
+      return campo === 'anios' ? r.sort((a, b) => COMPARAR(b[0], a[0])) : r.sort((a, b) => b[1] - a[1]);
+    });
   }
 
   // ---------------------------------------------------------------- listas (normales e inteligentes)
   function idsDeLista(l) {
     if (!l.reglas) return (l.ids || []).filter(id => S.canciones.has(id));
-    const R = l.reglas;
+    return recordar('lista:' + JSON.stringify(l.reglas), () => calcularLista(l.reglas));
+  }
+  function calcularLista(R) {
+    const q = norm(R.texto || '').split(/\s+/).filter(Boolean);
     const r = [...S.canciones.values()].filter(c => {
-      for (const k of ['categorias', 'generos', 'artistas', 'carpetas', 'estatus']) if (R[k] && R[k].length && !R[k].includes(OBT[k](c))) return false;
+      if (!cumple(c, R, q)) return false;   // categorías, géneros, años, artistas, carpetas, estatus y texto
       const an = +anioDe(c) || 0;
       if (R.anioDesde && (!an || an < R.anioDesde)) return false;
       if (R.anioHasta && (!an || an > R.anioHasta)) return false;
@@ -337,6 +431,8 @@
     const p = [], n = { categorias: 'Categoría', generos: 'Género', artistas: 'Artista', carpetas: 'Carpeta' };
     for (const k in n) if (R[k] && R[k].length) p.push(`${n[k]}: ${R[k].join(', ')}`);
     if (R.estatus && R.estatus.length) p.push('Estatus: ' + R.estatus.map(k => ESTATUS.find(e => e.clave === k).nombre).join(', '));
+    if (R.anios && R.anios.length) p.push('Año: ' + R.anios.join(', '));
+    if (R.texto) p.push(`que digan «${R.texto}»`);
     if (R.anioDesde || R.anioHasta) p.push(`Años ${R.anioDesde || '…'} a ${R.anioHasta || '…'}`);
     if (R.soloFavoritas) p.push('solo ❤');
     if (R.estrellasMin) p.push(`${R.estrellasMin}★ o más`);
@@ -405,6 +501,7 @@
       const raices = new Set(files.filter(f => f.webkitRelativePath).map(f => f.webkitRelativePath.split('/')[0] + '/'));
       if (raices.size) faltan = [...S.canciones.values()].filter(c => !vistas.has(c.id) && [...raices].some(r => (c.ruta || '').startsWith(r)));
     }
+    cambioDatos();
     if (nuevas.length || modo === 'actualizar')
       await anotar({ tipo: 'biblioteca', campo: modo === 'actualizar' ? 'actualizacion' : 'agregadas', antes: `${miles(antes)} canciones`, despues: `${miles(S.canciones.size)} canciones`,
         detalle: { nuevas: nuevas.map(c => `${c.titulo} — ${c.artista || 'Sin artista'}`), recuperadas, yaEstaban: ya, faltan: faltan.map(c => `${c.titulo} — ${c.artista || ''}`) } });
@@ -433,6 +530,7 @@
       S.cola = S.cola.filter(x => x !== id);
       nombres.push(`${c.titulo} — ${c.artista || ''}`);
     }
+    cambioDatos();
     if (sinAnotar) return nombres.length;
     if (nombres.length === 1) await anotar({ tipo: 'biblioteca', campo: 'quitada', antes: nombres[0], detalle: motivo || '' });
     else if (nombres.length) await anotar({ tipo: 'biblioteca', campo: 'quitadas', antes: `${miles(nombres.length)} canciones`, detalle: { quitadas: nombres, motivo } });
@@ -447,7 +545,7 @@
     let h;
     try { h = await window.showDirectoryPicker({ id: 'musica', mode: 'read' }); } catch (e) { return; }
     const antes = S.carpeta ? S.carpeta.name : '';
-    S.carpeta = h; S.permiso = true;
+    S.carpeta = h; S.permiso = true; S._fh.clear(); S._dirs.clear();
     await DB.guardarConfig('carpeta', h);
     await anotar({ tipo: 'biblioteca', campo: 'carpeta', antes, despues: h.name });
     await escanear('manual');
@@ -464,6 +562,7 @@
     async function recorrer(dir, base) {
       if (S.cancelar) throw new Error('cancelado');
       est.carpetas++; est.actual = base || dir.name; avance && avance(est);
+      if (base) S._dirs.set(base.toLowerCase(), dir);
       const archivos = [];
       for await (const [nombre, h] of dir.entries()) {
         if (S.cancelar) throw new Error('cancelado');
@@ -475,7 +574,7 @@
       for (let i = 0; i < archivos.length; i += 12) {
         if (S.cancelar) throw new Error('cancelado');
         await Promise.all(archivos.slice(i, i + 12).map(async ([ruta, nombre, h]) => {
-          try { const f = await h.getFile(); disco.set(ruta.toLowerCase(), { ruta, nombre, tamano: f.size, mtime: f.lastModified }); } catch (e) {}
+          try { const f = await h.getFile(); disco.set(ruta.toLowerCase(), { ruta, nombre, tamano: f.size, mtime: f.lastModified }); S._fh.set(ruta.toLowerCase(), h); } catch (e) {}
         }));
         est.canciones = disco.size; avance && avance(est);
       }
@@ -593,6 +692,7 @@
       detalle: { nuevas: dif.nuevas.map(d => d.nombre), recuperadas, modificadas: dif.modificadas.map(x => fmt(x[0])), movidas: dif.movidas.map(x => `${fmt(x[0])} → ${x[1].ruta}`), faltan: dif.faltan.map(fmt) } });
     cerrarModal();
     toast(`🔍 +${miles(dif.nuevas.length)} nuevas · ${dif.modificadas.length} modificadas · ${dif.faltan.length} ya no están${recuperadas.length ? ` · ${recuperadas.length} recuperaron su trayectoria` : ''}`);
+    cambioDatos();
     if (dif.totalApp === 0 && dif.nuevas.length && location.hash !== '#/biblioteca') location.hash = '#/biblioteca';
     pintar();
     completarDatos();
@@ -618,7 +718,7 @@
           } catch (e) {}
           delete c.pendienteDatos; lote.push(c); hechas++;
         }));
-        if (lote.length >= 40 || i + 4 >= pend.length) { await DB.varios('canciones', lote); lote = []; mostrar(); }
+        if (lote.length >= 40 || i + 4 >= pend.length) { await DB.varios('canciones', lote); lote = []; cambioDatos(); mostrar(); }
         if (hechas % 400 === 0 && /biblioteca|listas|top/.test(location.hash)) pintar();
       }
     } finally {
@@ -638,6 +738,7 @@
     const es = (await DB.todos('escuchas')).filter(e => e.cancionId === viejo); es.forEach(e => e.cancionId = nuevo); if (es.length) await DB.varios('escuchas', es);
     for (const l of S.listas.values()) if ((l.ids || []).includes(viejo)) { l.ids = l.ids.map(x => x === viejo ? nuevo : x); await DB.poner('listas', l); }
     S.cola = S.cola.map(x => x === viejo ? nuevo : x);
+    cambioDatos();
   }
 
   // ---------------------------------------------------------------- segundo plano y ventana flotante
@@ -871,13 +972,23 @@
     if (!S.canciones.size) return bienvenida();
     const F = S.filtros, r = filtrar();
     const chip = (campo, nombre) => `<button class="chip${F[campo].length ? ' on' : ''}" data-accion="filtro" data-campo="${campo}">${nombre}${F[campo].length ? ` <small>(${F[campo].length})</small>` : ' ▾'}</button>`;
-    const hayFiltro = ['categorias', 'generos', 'anios', 'artistas', 'carpetas', 'estatus'].some(k => F[k].length) || F.q;
+    const hayFiltro = CAMPOS_FILTRO.some(k => F[k].length) || F.q;
+    const cats = valoresDe('categorias').filter(([v, n]) => esCategoria(v) && n >= 2);
+    const nombreEst = k => (ESTATUS.find(e => e.clave === k) || {}).nombre || k;
+    const activos = CAMPOS_FILTRO.flatMap(k => F[k].map(v => `<button class="chip on" data-accion="quitarValor" data-campo="${k}" data-v="${esc(v)}">${esc(k === 'estatus' ? nombreEst(v) : v)} ✖</button>`));
+    if (F.q) activos.unshift(`<button class="chip on" data-accion="quitarTexto">«${esc(F.q)}» ✖</button>`);
     S._vistaIds = r.map(c => c.id);
-    return `${avisoCarpeta()}<input type="search" id="buscar" placeholder="🔎 Buscar canción, artista, categoría, año…" value="${esc(F.q)}" autocomplete="off">
-      <div class="desliza" style="margin-top:10px">${chip('categorias', 'Categoría')}${chip('generos', 'Género')}${chip('anios', 'Año')}${chip('artistas', 'Artista')}${chip('estatus', 'Estatus')}${chip('carpetas', 'Carpeta')}
-      ${hayFiltro ? '<button class="chip" data-accion="limpiarFiltros">✖ Limpiar</button>' : ''}</div>
-      <select id="orden" style="margin-top:8px">${[['titulo', 'Orden: A-Z título'], ['artista', 'Orden: A-Z artista'], ['escuchas', 'Orden: más sonadas'], ['estatus', 'Orden: mejor estatus'], ['anio', 'Orden: año (nuevas primero)'], ['anioAsc', 'Orden: año (viejas primero)'], ['recientes', 'Orden: recién agregadas']].map(([v, t]) => `<option value="${v}"${F.orden === v ? ' selected' : ''}>${t}</option>`).join('')}</select>
-      <div class="botones dos"><button class="btn prim" data-accion="sonarVista">▶ Sonar (${miles(r.length)})</button><button class="btn sec" data-accion="guardarVista">💾 Guardar como lista</button></div>
+    return `${avisoCarpeta()}<div class="busca"><input type="search" id="buscar" placeholder="🔎 Buscar canción, artista, categoría, año…" value="${esc(F.q)}" autocomplete="off">
+      ${F.q ? '<button class="ico-btn" data-accion="quitarTexto" aria-label="Borrar búsqueda">✖</button>' : ''}</div>
+      ${cats.length ? `<div class="desliza" style="margin-top:10px">${cats.map(([v, n]) => `<button class="chip${F.categorias.includes(v) ? ' on' : ''}" data-accion="toqueCategoria" data-v="${esc(v)}">${esc(v)} <small>${miles(n)}</small></button>`).join('')}</div>` : ''}
+      <div class="desliza" style="margin-top:8px">${chip('generos', '🎸 Género')}${chip('anios', '📆 Año')}${chip('artistas', '🎤 Artista')}${chip('estatus', '🏆 Estatus')}${chip('categorias', '🏷️ Categoría')}${chip('carpetas', '📁 Carpeta')}</div>
+      ${hayFiltro ? `<div class="chips" style="margin-top:8px">${activos.join('')}<button class="chip limpiar" data-accion="limpiarFiltros">🧹 Limpiar todo</button></div>` : ''}
+      <div class="acciones-fijas">
+        <button class="btn prim" data-accion="sonarVista">▶ Sonar ${miles(r.length)}</button>
+        <button class="btn sec" data-accion="guardarVista">🗂️ Crear lista</button>
+      </div>
+      <select id="orden">${[['titulo', 'Orden: A-Z título'], ['artista', 'Orden: A-Z artista'], ['escuchas', 'Orden: más sonadas'], ['estatus', 'Orden: mejor estatus'], ['anio', 'Orden: año (nuevas primero)'], ['anioAsc', 'Orden: año (viejas primero)'], ['recientes', 'Orden: recién agregadas']].map(([v, t]) => `<option value="${v}"${F.orden === v ? ' selected' : ''}>${t}</option>`).join('')}</select>
+      <p class="suave peq" style="margin:8px 2px">${hayFiltro ? `${miles(r.length)} de ${miles(S.canciones.size)} canciones` : `${miles(S.canciones.size)} canciones`}</p>
       <div class="lista">${r.slice(0, S.limite).map((c, i) => filaCancion(c, i)).join('')}</div>
       ${r.length > S.limite ? `<div class="botones"><button class="btn sec" data-accion="verMas">Ver más (${miles(r.length - S.limite)} restantes)</button></div>` : ''}
       ${!r.length ? '<p class="suave">No hay canciones con esos filtros.</p>' : ''}
@@ -999,7 +1110,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 4 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 5 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1047,10 +1158,43 @@
   function elegirFiltro(campo) {
     const nombres = { categorias: 'Categoría', generos: 'Género', anios: 'Año', artistas: 'Artista', carpetas: 'Carpeta', estatus: 'Estatus' };
     const vals = valoresDe(campo), sel = S.filtros[campo];
-    modal(`<h2>${nombres[campo]}</h2><p class="suave peq">Marca una o varias.</p>
+    S._campoFiltro = campo;
+    modal(`<h2>${nombres[campo]}</h2><p class="suave peq">Toca una o varias: se aplica al instante.</p>
       <input type="search" class="buscaSel" placeholder="🔎 Buscar…" style="margin-bottom:6px">
-      <div class="sel-opc" id="opcFiltro">${vals.map(([v, n, t]) => `<label class="opcion" data-t="${esc(norm(t))}"><input type="checkbox" value="${esc(v)}"${sel.includes(v) ? ' checked' : ''}> ${esc(t)} <small class="suave">${miles(n)}</small></label>`).join('')}</div>
-      <div class="botones dos"><button class="btn sec" data-accion="filtroNinguno">Quitar todo</button><button class="btn prim" data-accion="filtroAplicar" data-campo="${campo}">Aplicar</button></div>`);
+      <div class="sel-opc" id="opcFiltro" style="max-height:52vh;overflow:auto">${vals.map(([v, n, t]) => `<label class="opcion" data-t="${esc(norm(t))}"><input type="checkbox" class="filtroVivo" value="${esc(v)}"${sel.includes(v) ? ' checked' : ''}> ${esc(t)} <small class="suave">${miles(n)}</small></label>`).join('')}</div>
+      <div class="botones dos"><button class="btn sec" data-accion="filtroNinguno">🧹 Limpiar ${nombres[campo].toLowerCase()}</button><button class="btn prim" data-accion="cerrar" id="filtroListo">✔ Ver ${miles(filtrar().length)}</button></div>`);
+  }
+  // Aplica el filtro mientras se marca (sin botón Aplicar)
+  function filtroVivo() {
+    const campo = S._campoFiltro; if (!campo) return;
+    S.filtros[campo] = [...document.querySelectorAll('#opcFiltro input:checked')].map(i => i.value);
+    S.limite = 150; pintar();
+    const b = $('#filtroListo'); if (b) b.textContent = `✔ Ver ${miles(filtrar().length)}`;
+  }
+  // Crear lista con lo filtrado: inteligente (se actualiza sola con estos filtros) o fija (solo estas canciones)
+  function reglasDeFiltros() {
+    const F = S.filtros, R = {};
+    for (const k of CAMPOS_FILTRO) if (F[k].length) R[k] = F[k].slice();
+    if (F.q) R.texto = F.q;
+    R.orden = F.orden === 'titulo' ? 'azar' : F.orden;
+    return R;
+  }
+  function nombreSugerido() {
+    const F = S.filtros, p = [];
+    for (const k of ['categorias', 'generos', 'artistas', 'anios', 'carpetas']) if (F[k].length) p.push(F[k].slice(0, 2).join(' y ') + (F[k].length > 2 ? '…' : ''));
+    if (F.estatus.length) p.push(F.estatus.map(k => (ESTATUS.find(e => e.clave === k) || {}).nombre).join(' y '));
+    if (F.q) p.push(F.q);
+    return p.join(' · ') || 'Mi lista';
+  }
+  function crearListaDeFiltros() {
+    const n = (S._vistaIds || []).length;
+    if (!n) return toast('No hay canciones con esos filtros', true);
+    modal(`<h2>🗂️ Crear lista con lo filtrado</h2><p class="suave">${miles(n)} canciones · ${esc(describirReglas(reglasDeFiltros()))}</p>
+      <div class="campo"><label>Nombre</label><input id="nlNombre" value="${esc(nombreSugerido())}" autocomplete="off"></div>
+      <div class="botones">
+        <button class="btn prim" data-accion="crearDeFiltros" data-tipo="inteligente">⚡ Inteligente<br><small style="font-weight:600">se actualiza sola con estos filtros (nuevas, estatus…)</small></button>
+        <button class="btn sec" data-accion="crearDeFiltros" data-tipo="fija">📌 Fija<br><small style="font-weight:600">solo estas ${miles(n)} canciones</small></button>
+        <button class="btn sec" data-accion="cerrar">Cancelar</button></div>`);
   }
 
   // Plantillas de listas inteligentes: un toque y queda armada; después se pueden cambiar las reglas
@@ -1072,6 +1216,7 @@
   }
   function formularioInteligente(l, base) {
     const R = (l && l.reglas) || base || {};
+    S._reglasExtra = { anios: R.anios, texto: R.texto };   // filtros que vienen de la Biblioteca y no tienen casilla aquí
     const nombre = l ? l.nombre : (base && base._nombre) || '';
     const n = k => R[k] || 0;
     modal(`<h2>⚡ ${l ? 'Cambiar reglas' : 'Lista inteligente'}</h2><p class="suave peq">Se arma sola cada vez con tus reglas. Deja en blanco lo que no importe.</p>
@@ -1104,6 +1249,7 @@
     const R = { categorias: v('categorias'), generos: v('generos'), artistas: v('artistas'), estatus: v('estatus'), carpetas: v('carpetas'),
       anioDesde: num('#liDesde'), anioHasta: num('#liHasta'), estrellasMin: +$('#liEst').value, escuchasMin: num('#liEsc'), sinOirDias: num('#liDias'),
       agregadasDias: num('#liAgr'), limite: num('#liLim'), orden: $('#liOrden').value, soloFavoritas: $('#liFav').checked, nuncaEscuchadas: $('#liNunca').checked, excluirSaltadas: $('#liSalt').checked };
+    Object.assign(R, S._reglasExtra || {});
     for (const k of Object.keys(R)) if (!R[k] || (Array.isArray(R[k]) && !R[k].length)) delete R[k];
     R.orden = $('#liOrden').value;
     return R;
@@ -1133,7 +1279,15 @@
       if (armarCola({ tipo: 'ids', ids, nombre, enOrden: !S.azar }, b.dataset.id)) sonar(0);
     },
     sonarVista() { sonarFuente({ tipo: 'ids', ids: (S._vistaIds || []).slice(), nombre: 'Biblioteca' }); },
-    async guardarVista() { const n = prompt('Nombre de la lista:'); if (!n) return; await crearLista(n.trim(), (S._vistaIds || []).slice()); toast('🗂️ Lista guardada'); pintar(); },
+    guardarVista() { crearListaDeFiltros(); },
+    async crearDeFiltros(b) {
+      const nombre = ($('#nlNombre').value || '').trim() || nombreSugerido();
+      const l = b.dataset.tipo === 'inteligente' ? await crearLista(nombre, [], reglasDeFiltros()) : await crearLista(nombre, (S._vistaIds || []).slice());
+      cerrarModal(); toast(`${l.reglas ? '⚡' : '📌'} Lista «${nombre}» creada`); location.hash = '#/lista/' + l.uid;
+    },
+    toqueCategoria(b) { const v = b.dataset.v, a = S.filtros.categorias; S.filtros.categorias = a.includes(v) ? a.filter(x => x !== v) : [...a, v]; S.limite = 150; pintar(); },
+    quitarValor(b) { const k = b.dataset.campo; S.filtros[k] = S.filtros[k].filter(x => x !== b.dataset.v); S.limite = 150; pintar(); },
+    quitarTexto() { S.filtros.q = ''; S.limite = 150; pintar(); },
     menuCancion(b) { menuCancion(b.dataset.id); },
     sonarYa(b) { cerrarModal(); const id = b.dataset.id; if (S.actual) { S.cola.splice(S.pos + 1, 0, id); sonar(S.pos + 1); } else sonarFuente({ tipo: 'ids', ids: [id], nombre: 'Una canción' }); },
     despues(b) { cerrarModal(); const id = b.dataset.id; if (!S.cola.length) return A.sonarYa(b); S.cola.splice(S.pos + 1, 0, id); guardarEstado(); toast('⏭ Suena después de la actual'); },
@@ -1163,7 +1317,7 @@
     deshacer(b) { deshacer(+b.dataset.n); },
     histFiltro(b) { S.histFiltro = b.dataset.v; pintar(); },
     filtro(b) { elegirFiltro(b.dataset.campo); },
-    filtroNinguno() { document.querySelectorAll('#opcFiltro input').forEach(i => i.checked = false); },
+    filtroNinguno() { document.querySelectorAll('#opcFiltro input').forEach(i => i.checked = false); filtroVivo(); },
     filtroAplicar(b) { S.filtros[b.dataset.campo] = [...document.querySelectorAll('#opcFiltro input:checked')].map(i => i.value); S.limite = 150; cerrarModal(); pintar(); },
     limpiarFiltros() { Object.assign(S.filtros, { q: '', categorias: [], generos: [], anios: [], artistas: [], carpetas: [], estatus: [] }); pintar(); },
     verMas() { S.limite += 300; pintar(); },
@@ -1262,6 +1416,7 @@
     if (t.id === 'elegirArchivos' || t.id === 'elegirCarpeta') procesarArchivos(t.files, S._modo || 'agregar').catch(err => { cerrarModal(); toast('⚠️ ' + err.message, true); }).finally(() => { t.value = ''; });
     else if (t.id === 'elegirRespaldo') { if (t.files[0]) restaurar(t.files[0]).finally(() => { t.value = ''; }); }
     else if (t.id === 'orden') { S.filtros.orden = t.value; pintar(); }
+    else if (t.classList.contains('filtroVivo')) filtroVivo();
     else if (t.dataset.ajuste) { S.config[t.dataset.ajuste] = t.checked; DB.guardarConfig('ajustes', S.config); }
     else if (t.dataset.ajusteNum) { S.config[t.dataset.ajusteNum] = +t.value; DB.guardarConfig('ajustes', S.config); }
     else if (t.id === 'barraTiempo') { audio.currentTime = +t.value; delete t.dataset.arrastrando; }
@@ -1269,7 +1424,7 @@
   });
   document.addEventListener('input', e => {
     const t = e.target;
-    if (t.id === 'buscar') { clearTimeout(A._b); A._b = setTimeout(() => { S.filtros.q = t.value; S.limite = 150; const pos = t.selectionStart; pintar(); const n = $('#buscar'); if (n) { n.focus(); n.setSelectionRange(pos, pos); } }, 250); }
+    if (t.id === 'buscar') { clearTimeout(A._b); A._b = setTimeout(() => { S.filtros.q = t.value; S.limite = 150; const pos = t.selectionStart; pintar(); const n = $('#buscar'); if (n) { n.focus(); n.setSelectionRange(pos, pos); } }, 150); }
     else if (t.id === 'barraTiempo') { t.dataset.arrastrando = '1'; const a = $('#tActual'); if (a) a.textContent = mmss(+t.value); }
     else if (t.classList.contains('buscaSel')) { const q = norm(t.value), cont = t.parentElement.querySelector('.sel-opc') || t.nextElementSibling; cont.querySelectorAll('.opcion').forEach(o => o.hidden = q && !o.dataset.t.includes(q)); }
     else if (t.closest && t.closest('#modalHoja') && $('#liCuenta')) { clearTimeout(A._c); A._c = setTimeout(contarInteligente, 300); }

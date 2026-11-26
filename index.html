@@ -54,6 +54,14 @@ p{margin:6px 0}
 .chip small{font-weight:600;opacity:.8}
 .desliza{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;margin:0 -16px;padding-left:16px;padding-right:16px;scrollbar-width:none}
 .desliza .chip{flex:0 0 auto}
+.busca{position:relative}
+.busca .ico-btn{position:absolute;right:4px;top:3px;font-size:1.2rem;color:var(--suave)}
+.busca input{padding-right:52px}
+.chip.limpiar{background:transparent;border-color:var(--aviso);color:var(--aviso)}
+/* Sonar / Crear lista siempre a mano mientras se baja por la lista */
+.acciones-fijas{position:sticky;top:calc(62px + env(safe-area-inset-top));z-index:3;background:var(--bg);display:grid;grid-template-columns:1.4fr 1fr;
+  gap:10px;padding:10px 0;margin:4px 0}
+.acciones-fijas .btn{min-height:54px}
 .caja{background:var(--panel);border:1px solid var(--linea);border-radius:16px;padding:14px;margin:12px 0}
 .caja.aviso-c{border-color:var(--aviso)}
 input,select,textarea{width:100%;min-height:54px;padding:10px 14px;background:var(--panel2);border:2px solid var(--linea);border-radius:14px;font-size:1.1rem}
