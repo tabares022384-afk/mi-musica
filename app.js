@@ -19,7 +19,10 @@
     config: { noRepetirArtista: true, pantallaEncendida: true, diasRespaldo: 7, autoEscaneo: true }, wake: null, histFiltro: 'todo',
     carpeta: null, permiso: false, escaneando: false, ultimoEscaneo: '',
   };
-  const puedeCarpeta = () => typeof window.showDirectoryPicker === 'function';
+  // APP INSTALADA (APK): la música sale del catálogo de Android y suena en segundo plano con el servicio propio
+  const NATIVO = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+  const Bib = NATIVO ? (window.Capacitor.registerPlugin ? window.Capacitor.registerPlugin('Biblioteca') : window.Capacitor.Plugins.Biblioteca) : null;
+  const puedeCarpeta = () => !NATIVO && typeof window.showDirectoryPicker === 'function';
   const EXT_AUDIO = /\.(mp3|m4a|aac|ogg|oga|opus|flac|wav|weba|m4b)$/i;
   const EXT_NO_REPRODUCE = /\.(wma|amr|ape|aiff?|mid|midi|ra|ac3|dsf|mka)$/i;   // audio que el teléfono no puede tocar en la app
   const ESTATUS = [
@@ -88,6 +91,7 @@
     S.escLocal = new Map();
     const mes = ahora().slice(0, 7);
     for (const e of es) sumarEscucha(e, mes);
+    S.escuchas = es;   // todas las escuchas con su fecha: de aquí sale «Mi resumen»
     S.config = Object.assign(S.config, await DB.leerConfig('ajustes', {}));
     S.ultimoRespaldo = await DB.leerConfig('ultimoRespaldo', '');
     S.ultimoEscaneo = await DB.leerConfig('ultimoEscaneo', '');
@@ -196,12 +200,13 @@
     const e = { uuid: uid(), cancionId: c.id, fecha: ahora(), segundos: Math.round(seg * 10) / 10, clase };
     DB.poner('escuchas', e);
     sumarEscucha(e, e.fecha.slice(0, 7));
+    if (S.escuchas) S.escuchas.push(e);
     cambioDatos();
   }
   // Deja lista la siguiente canción mientras suena la actual: el cambio es inmediato
   function prepararSiguiente() {
     const id = S.cola[S.pos + 1], c = id && S.canciones.get(id);
-    if (!c || (S._pre && S._pre.id === id)) return;
+    if (!c || c.origen === 'android' || (S._pre && S._pre.id === id)) return;
     archivoDe(c).then(f => { S._pre = { id, f }; }).catch(() => {});
   }
   async function sonar(pos, desde) {
@@ -213,11 +218,17 @@
     S.actual = c;
     refrescarSonando();   // la pantalla cambia al instante, antes de cargar el archivo
     try {
-      const f = (S._pre && S._pre.id === c.id) ? S._pre.f : await archivoDe(c);
-      S._pre = null;
-      if (S.url) URL.revokeObjectURL(S.url);
-      S.url = URL.createObjectURL(f);
-      audio.src = S.url;
+      if (c.origen === 'android') {
+        // App instalada: el archivo se toca directo desde el teléfono (sin copiarlo ni abrirlo antes)
+        if (S.url) { URL.revokeObjectURL(S.url); S.url = null; }
+        audio.src = window.Capacitor.convertFileSrc(c.ruta);
+      } else {
+        const f = (S._pre && S._pre.id === c.id) ? S._pre.f : await archivoDe(c);
+        S._pre = null;
+        if (S.url) URL.revokeObjectURL(S.url);
+        S.url = URL.createObjectURL(f);
+        audio.src = S.url;
+      }
       if (desde) audio.currentTime = desde;
       S.ultimoT = desde || 0;
       await audio.play().catch(() => {});
@@ -280,6 +291,7 @@
     } catch (e) { return 'icono-512.png'; }
   }
   function sesionMedios(c) {
+    avisarNativo();
     if (!('mediaSession' in navigator)) return;
     navigator.mediaSession.metadata = new MediaMetadata({ title: c.titulo || c.archivo, artist: c.artista || '', album: categoriaDe(c) || c.carpeta || '',
       artwork: [{ src: caratula(c), sizes: '512x512', type: 'image/png' }] });
@@ -294,6 +306,30 @@
   audio.addEventListener('loadedmetadata', posicionMedios);
   audio.addEventListener('seeked', posicionMedios);
   audio.addEventListener('play', posicionMedios);
+  // App instalada: la tarjeta de notificaciones (servicio de Android) se actualiza con cada cambio
+  let _avisoT = 0;
+  function avisarNativo() {
+    if (!NATIVO || !S.actual) return;
+    clearTimeout(_avisoT);
+    _avisoT = setTimeout(() => {
+      const c = S.actual;
+      Bib.notificar({ titulo: c.titulo || c.archivo, artista: [c.artista, categoriaDe(c)].filter(Boolean).join(' · '), sonando: !audio.paused,
+        duracionMs: Math.round((audio.duration || c.duracion || 0) * 1000), posicionMs: Math.round((audio.currentTime || 0) * 1000) }).catch(() => {});
+    }, 150);
+  }
+  if (NATIVO) {
+    ['play', 'pause', 'seeked', 'loadedmetadata'].forEach(ev => audio.addEventListener(ev, avisarNativo));
+    audio.addEventListener('play', () => { if (!S._avisosPedidos) { S._avisosPedidos = true; Bib.permisoAvisos().catch(() => {}); } }, { once: true });
+    Bib.addListener('accion', e => {
+      const t = (e && e.tipo) || '';
+      if (t === 'siguiente') siguiente();
+      else if (t === 'anterior') anterior();
+      else if (t === 'play') { if (audio.paused) playPausa(); }
+      else if (t === 'pausa') audio.pause();
+      else if (t.startsWith('ir:')) audio.currentTime = (+t.slice(3) || 0) / 1000;
+      avisarNativo();
+    });
+  }
   if ('mediaSession' in navigator) {
     const ms = navigator.mediaSession;
     ms.setActionHandler('play', () => playPausa());
@@ -315,6 +351,7 @@
     if (document.visibilityState !== 'visible') { guardarEstado(); return; }
     pedirPantalla();
     // Al volver a la app (por ejemplo después de pasar canciones al teléfono) escanea sola si pasaron 5 minutos
+    if (NATIVO) { if (S.config.autoEscaneo && S.canciones.size && diasDesde(S.ultimoEscaneo) > 5 / 1440) escanearAndroid('auto'); return; }
     if (S.carpeta && S.permiso && S.config.autoEscaneo && diasDesde(S.ultimoEscaneo) > 5 / 1440) escanear('auto');
   });
 
@@ -367,7 +404,8 @@
     const firma = `${c.titulo}|${c.artista}|${c.album}|${c.genero}|${c.anio}`;
     const t = _textos.get(c);
     if (t && t[0] === firma) return t[1];
-    const n = norm(`${c.titulo} ${c.artista} ${c.album} ${c.genero} ${c.anio} ${c.archivo}`);
+    // Búsqueda en TODO lo de la canción: título, artista, categoría, género, año, carpeta, ruta y nombre del archivo
+    const n = norm(`${c.titulo} ${c.artista} ${c.album} ${c.genero} ${c.anio} ${c.carpeta || ''} ${c.archivo} ${(c.ruta || '').split('/').slice(-3, -1).join(' ')}`);
     _textos.set(c, [firma, n]); return n;
   };
   const CAMPOS_FILTRO = ['categorias', 'generos', 'anios', 'artistas', 'carpetas', 'estatus'];
@@ -390,7 +428,10 @@
   function filtrar() {
     const F = S.filtros;
     return recordar('filtrar:' + JSON.stringify(F), () => {
-      const q = norm(F.q).split(/\s+/).filter(Boolean);
+      let q = norm(F.q).split(/\s+/).filter(Boolean);
+      // Varias palabras: si están juntas como frase en alguna canción («carpeta 3», «marc anthony»), se busca la frase exacta
+      const frase = q.join(' ');
+      if (q.length > 1 && [...S.canciones.values()].some(c => textoBusqueda(c).includes(frase))) q = [frase];
       return ordenar([...S.canciones.values()].filter(c => cumple(c, F, q)), F.orden);
     });
   }
@@ -807,7 +848,110 @@
     return { nuevas, modificadas, faltan, movidas, totalApp, totalDisco: disco.size, sospechoso, hayCambios: nuevas.length + modificadas.length + faltan.length + movidas.length > 0 };
   }
   // modo: 'manual' (muestra lo que encontró antes de aplicar si hay borradas) | 'auto' (al abrir la app)
+  // ======== App instalada: la música sale del CATÁLOGO DE ANDROID (el mismo que usan las demás apps) ========
+  // Android ya tiene título, artista, álbum (= categoría), género y año de cada canción: no hay que abrir archivos.
+  const sinDato = s => (!s || s === '<unknown>') ? '' : String(s).trim();
+  async function escanearAndroid(modo) {
+    if (S.escaneando) return;
+    S.escaneando = true;
+    const manual = modo !== 'auto';
+    const av = manual ? ventanaAvance('🎵 Leyendo la música de tu teléfono', 'Android ya tiene el catálogo de tus canciones con artista, álbum y género: tarda unos segundos.') : null;
+    try {
+      const p = await Bib.permiso();
+      if (!p || !p.ok) {
+        if (av) av.fin();
+        cerrarModal();
+        if (manual) modal(`<h2>🔒 Falta el permiso de música</h2><p>Sin ese permiso la app no puede ver tus canciones.</p>
+          <p class="peq">Abre <b>Ajustes del teléfono › Aplicaciones › Mi Música › Permisos › Música y audio</b> y elige <b>Permitir</b>. Luego vuelve y toca «Cargar mi música».</p>
+          <div class="botones"><button class="btn sec" data-accion="cerrar">Entendido</button></div>`);
+        return;
+      }
+      if (av) av.texto('🎵 Consultando a Android…', '');
+      const r = await Bib.leer();
+      const todas = (r && r.canciones) || [];
+      const lista = todas.filter(x => x.musica !== false && x.ruta);
+      S.infoAndroid = { total: r.total, noMusica: r.noMusica, android: r.android, fecha: ahora() };
+      DB.guardarConfig('infoAndroid', S.infoAndroid);
+      if (av) av.texto(`🎵 ${miles(lista.length)} canciones en el catálogo`, 'Comparando con las que ya conoce la app…');
+      const enApp = new Map([...S.canciones.values()].filter(c => c.origen === 'android').map(c => [(c.ruta || '').toLowerCase(), c]));
+      const disco = new Map(lista.map(x => [x.ruta.toLowerCase(), x]));
+      const nuevas = [], modificadas = [], faltan = [], movidas = [];
+      for (const [k, x] of disco) {
+        const c = enApp.get(k);
+        if (!c) nuevas.push(x);
+        else if (c.tamano !== x.tamano || c.mtime !== x.modificado || c._genAndroid !== sinDato(x.genero) || c._albAndroid !== sinDato(x.album)) modificadas.push([c, x]);
+      }
+      for (const [k, c] of enApp) if (!disco.has(k)) faltan.push(c);
+      for (let i = faltan.length - 1; i >= 0; i--) {
+        const c = faltan[i], j = nuevas.findIndex(x => (x.nombre || '').toLowerCase() === (c.archivo || '').toLowerCase() && x.tamano === c.tamano);
+        if (j >= 0) { movidas.push([c, nuevas[j]]); nuevas.splice(j, 1); faltan.splice(i, 1); }
+      }
+      const totalApp = enApp.size;
+      const sospechoso = faltan.length > 0 && (lista.length === 0 || (faltan.length >= 5 && faltan.length > totalApp * 0.3));
+      const dif = { android: true, nuevas: nuevas.map(x => Object.assign({ nombre: x.nombre }, x)), modificadas, faltan, movidas, totalApp, totalDisco: lista.length, sospechoso,
+        hayCambios: nuevas.length + modificadas.length + faltan.length + movidas.length > 0 };
+      S._dif = dif;
+      await DB.guardarConfig('ultimoEscaneo', ahora()); S.ultimoEscaneo = ahora();
+      if (av) av.fin();
+      if (!dif.hayCambios) { if (manual) { cerrarModal(); toast(`✅ Al día · ${miles(lista.length)} canciones`); } return; }
+      if (totalApp === 0 || !faltan.length || (modo === 'auto' && !sospechoso)) { await aplicarAndroid(dif, modo); return; }
+      mostrarEscaneo(dif);
+    } catch (e) {
+      if (av) av.fin();
+      cerrarModal();
+      if (manual) toast('⚠️ ' + (e.message || e), true);
+    } finally { S.escaneando = false; }
+  }
+  function datosDeAndroid(c, x) {
+    const n = Etiquetas.desdeNombre(x.nombre || c.archivo || '');
+    const campos = {
+      titulo: sinDato(x.titulo) || n.titulo,
+      artista: sinDato(x.artista) || sinDato(x.albumArtista) || n.artista,
+      album: sinDato(x.album),
+      genero: Etiquetas.normGenero(sinDato(x.genero)),
+      anio: x.anio > 0 ? String(x.anio).slice(0, 4) : '',
+    };
+    for (const k in campos) if (!(c.editados && k in c.editados)) c[k] = campos[k];   // lo corregido a mano no se pisa
+    c._genAndroid = sinDato(x.genero); c._albAndroid = sinDato(x.album);
+    c.tamano = x.tamano; c.mtime = x.modificado; c.duracion = Math.round((x.duracionMs || 0) / 100) / 10;
+    c.idAndroid = x.id; c.datosLeidos = 2; c.tipoEtiqueta = 'Android'; delete c.pendienteDatos;
+    const partes = (x.ruta || '').split('/'); c.carpeta = partes.length > 1 ? partes[partes.length - 2] : '';
+    return c;
+  }
+  async function aplicarAndroid(dif, origen) {
+    const av = origen !== 'auto' ? ventanaAvance('➕ Guardando tu música', 'Con artista, álbum, género y año que ya tiene Android.') : null;
+    const recuperadas = [];
+    for (const [c, x] of dif.movidas) { c.ruta = x.ruta; c.archivo = x.nombre; datosDeAndroid(c, x); }
+    for (const [c, x] of dif.modificadas) datosDeAndroid(c, x);
+    const cambiadas = [...dif.movidas.map(m => m[0]), ...dif.modificadas.map(m => m[0])];
+    for (let i = 0; i < cambiadas.length; i += 300) await DB.varios('canciones', cambiadas.slice(i, i + 300));
+    let lote = [];
+    for (let i = 0; i < dif.nuevas.length; i++) {
+      const x = dif.nuevas[i];
+      const c = datosDeAndroid({ id: 'a' + uid(), origen: 'android', ruta: x.ruta, archivo: x.nombre, favorita: 0, calificacion: 0, alta: ahora() }, x);
+      const m = aplicarMemoria(c);   // si la canción ya estuvo (respaldo o la app web), recupera su trayectoria
+      if (m) { recuperadas.push(c.titulo); datosDeAndroid(c, x); await olvidarMemoria(m); }
+      S.canciones.set(c.id, c); lote.push(c);
+      if (lote.length >= 300 || i === dif.nuevas.length - 1) {
+        await DB.varios('canciones', lote); lote = [];
+        if (av) { av.texto(`➕ ${miles(i + 1)} de ${miles(dif.nuevas.length)} canciones`, ''); av.porcentaje((i + 1) / dif.nuevas.length * 100); }
+      }
+    }
+    if (dif.faltan.length) await quitarDeApp(dif.faltan.map(c => c.id), 'Ya no está en el teléfono', true);
+    if (av) av.fin();
+    const fmt = c => `${c.titulo} — ${c.artista || 'Sin artista'}`;
+    await anotar({ tipo: 'biblioteca', campo: 'escaneo', origen: origen === 'auto' ? 'automático' : 'manual',
+      antes: `${miles(dif.totalApp)} canciones`, despues: `${miles([...S.canciones.values()].filter(c => c.origen === 'android').length)} canciones`,
+      detalle: { nuevas: dif.nuevas.map(x => x.nombre), recuperadas, modificadas: dif.modificadas.map(m => fmt(m[0])), movidas: dif.movidas.map(m => `${fmt(m[0])} → ${m[1].ruta}`), faltan: dif.faltan.map(fmt) } });
+    cambioDatos();
+    cerrarModal();
+    toast(`🎵 +${miles(dif.nuevas.length)} nuevas · ${miles(dif.modificadas.length)} actualizadas · ${miles(dif.faltan.length)} ya no están${recuperadas.length ? ` · ${recuperadas.length} con su trayectoria` : ''}`);
+    if (dif.totalApp === 0 && dif.nuevas.length && location.hash !== '#/biblioteca') location.hash = '#/biblioteca';
+    pintar();
+  }
+
   async function escanear(modo) {
+    if (NATIVO) return escanearAndroid(modo === 'completo' ? 'manual' : modo);
     if (S.escaneando || !S.carpeta) return;
     if (!S.permiso) { if (modo === 'auto') { pintar(); return; } if (!(await pedirPermiso())) return toast('Sin permiso no puedo leer tu carpeta', true); }
     S.escaneando = true;
@@ -848,7 +992,7 @@
   }
   function mostrarEscaneo(dif) {
     const lista = (arr, f) => arr.slice(0, 25).map(f).map(esc).join(' · ') + (arr.length > 25 ? ' …' : '');
-    modal(`<h2>🔍 Lo que cambió en tu carpeta</h2>
+    modal(`<h2>🔍 Lo que cambió en ${dif.android ? 'tu música' : 'tu carpeta'}</h2>
       <div class="caja">
       <p>➕ <b>${miles(dif.nuevas.length)}</b> nuevas</p>${dif.nuevas.length ? `<p class="suave peq">${lista(dif.nuevas, d => d.nombre)}</p>` : ''}
       <p>✏️ <b>${miles(dif.modificadas.length)}</b> modificadas</p>${dif.modificadas.length ? `<p class="suave peq">${lista(dif.modificadas, x => x[0].titulo)}</p>` : ''}
@@ -1139,7 +1283,8 @@
     const L = [];
     L.push(`MI MÚSICA — DIAGNÓSTICO ${ahora()} · versión ${(document.body.innerText.match(/versión (\d+)/) || [])[1] || '?'}`);
     L.push(`Canciones: ${t.length} · de carpeta: ${t.filter(c => c.origen === 'carpeta').length} · copiadas: ${t.filter(c => c.origen !== 'carpeta').length}`);
-    L.push(`Carpetas: ${S.raices.map(r => `${r.h.name}${r.ok ? '' : ' (sin permiso)'}`).join(', ') || 'ninguna'} · permiso: ${S.permiso ? 'sí' : 'no'}`);
+    if (NATIVO) L.push(`APP INSTALADA · catálogo de Android: ${S.infoAndroid ? `${S.infoAndroid.total} audios, ${S.infoAndroid.noMusica} no son música, Android ${S.infoAndroid.android}` : 'sin leer'}`);
+    else L.push(`Carpetas: ${S.raices.map(r => `${r.h.name}${r.ok ? '' : ' (sin permiso)'}`).join(', ') || 'ninguna'} · permiso: ${S.permiso ? 'sí' : 'no'}`);
     L.push(`Con género: ${t.length - sinGen.length} · sin género: ${sinGen.length} · con categoría: ${t.length - sinCat.length} · con año: ${t.filter(c => anioDe(c)).length}`);
     L.push(`Pendientes de leer: ${t.filter(c => c.pendienteDatos).length} · con error al leer: ${t.filter(c => c.errorDatos).length}`);
     L.push(`Tipos de archivo: ${cuenta(t, ext).map(([k, n]) => `${k} ${n}`).join(', ')}`);
@@ -1197,14 +1342,21 @@
         <button class="ib solo-normal${S.repetir !== 'no' ? ' on' : ''}" data-accion="repetir" aria-label="Repetir">${S.repetir === 'una' ? '🔂' : '🔁'}</button>
         <button class="ib solo-normal" data-accion="verCola" aria-label="A continuación">☰</button>
         <button class="ib solo-normal" data-accion="menuCancion" data-id="${esc(c.id)}" aria-label="Más opciones">⋮</button>
-        ${PUEDE_PIP ? '<button class="ib flotante" data-accion="flotante" aria-label="Ventana flotante">🪟</button>' : ''}
+        ${PUEDE_PIP && !NATIVO ? '<button class="ib flotante" data-accion="flotante" aria-label="Ventana flotante">🪟</button>' : ''}
       </div>
       ${estrellasHtml(c, 'estrellas')}
+      ${colaHtml()}
       <p class="suave peq solo-normal">▶ ${miles(t.esc)} escuchas · ⏭ ${miles(t.sal)} saltos${t.ultima ? ' · última ' + fechaCorta(t.ultima) : ''}</p>
       <button class="fuente solo-normal" data-accion="elegirFuente"><span>🎚️ Sonando: <b>${esc(S.fuente.nombre)}</b> <small class="suave">(${S.pos + 1} de ${S.cola.length})</small></span><span>›</span></button>
     </div>`;
   };
   function bienvenida() {
+    if (NATIVO) return `<h2>🎵 Bienvenido a Mi Música</h2>
+      <div class="caja"><p><b>1.</b> ¿Ya tenías la app web? Primero toca <b>Restaurar respaldo</b> para traer tu trayectoria (estatus, ❤, escuchas, listas).</p>
+      <p><b>2.</b> Toca <b>Cargar mi música</b> y, cuando Android pregunte, elige <b>Permitir</b>.</p>
+      <p><b>3.</b> Listo: aparecen todas las canciones del teléfono con artista, álbum, género y año, igual que en las demás apps.</p></div>
+      <div class="botones"><button class="btn sec" data-accion="restaurar">📂 Restaurar respaldo</button>
+      <button class="btn prim" data-accion="cargarAndroid">🎵 Cargar mi música</button></div>`;
     if (puedeCarpeta()) return `<h2>🎵 Bienvenido a Mi Música</h2>
       <div class="caja"><p><b>1.</b> ¿Ya tenías la app? Primero toca <b>Restaurar respaldo</b> para recuperar tu trayectoria (estatus, ❤, escuchas, listas).</p>
       <p><b>2.</b> Toca <b>Conectar mi carpeta de música</b> y elige la carpeta donde guardas las canciones (por ejemplo <b>Music</b>).</p>
@@ -1242,6 +1394,7 @@
       </div>
       <select id="orden">${[['titulo', 'Orden: A-Z título'], ['artista', 'Orden: A-Z artista'], ['escuchas', 'Orden: más sonadas'], ['estatus', 'Orden: mejor estatus'], ['anio', 'Orden: año (nuevas primero)'], ['anioAsc', 'Orden: año (viejas primero)'], ['recientes', 'Orden: recién agregadas']].map(([v, t]) => `<option value="${v}"${F.orden === v ? ' selected' : ''}>${t}</option>`).join('')}</select>
       <p class="suave peq" style="margin:8px 2px">${hayFiltro ? `${miles(r.length)} de ${miles(S.canciones.size)} canciones` : `${miles(S.canciones.size)} canciones`}</p>
+      ${F.q ? sugerenciasBusqueda(F.q) : ''}
       <div class="lista">${r.slice(0, S.limite).map((c, i) => filaCancion(c, i)).join('')}</div>
       ${r.length > S.limite ? `<div class="botones"><button class="btn sec" data-accion="verMas">Ver más (${miles(r.length - S.limite)} restantes)</button></div>` : ''}
       ${!r.length ? '<p class="suave">No hay canciones con esos filtros.</p>' : ''}
@@ -1297,8 +1450,117 @@
     return cabTop(conteo, tot, modo) + `<div class="lista">${lista.map((c, i) => filaCancion(c, i, { rank: i + 1, dato: dato(c) })).join('') || '<p class="suave">Todavía no hay datos.</p>'}</div>
       ${lista.length ? `<div class="botones"><button class="btn sec" data-accion="listaDesdeRanking" data-modo="${modo}">⚡ Crear lista inteligente con este ranking</button></div>` : ''}`;
   };
+  // ======== MI RESUMEN: semana, mes, trimestre, año y todo, comparado con el periodo anterior ========
+  const PERIODOS = [['semana', 'Esta semana', 'la semana pasada'], ['mes', 'Este mes', 'el mes pasado'], ['trimestre', 'Este trimestre', 'el trimestre pasado'],
+    ['anio', 'Este año', 'el año pasado'], ['todo', 'Todo', '']];
+  const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+  const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+  const txtFecha = d => { const p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} 00:00:00`; };
+  // Inicio del periodo (atras = 0 el actual, 1 el anterior…)
+  function inicioPeriodo(tipo, atras) {
+    const h = new Date(); h.setHours(0, 0, 0, 0);
+    if (tipo === 'semana') { const d = (h.getDay() + 6) % 7; h.setDate(h.getDate() - d - 7 * atras); }
+    else if (tipo === 'mes') { h.setDate(1); h.setMonth(h.getMonth() - atras); }
+    else if (tipo === 'trimestre') { h.setDate(1); h.setMonth(Math.floor(h.getMonth() / 3) * 3 - 3 * atras); }
+    else if (tipo === 'anio') { h.setMonth(0, 1); h.setFullYear(h.getFullYear() - atras); }
+    else return '0000';
+    return txtFecha(h);
+  }
+  function datosCancion(id) {
+    const c = S.canciones.get(id) || S.memoria.get(id) || {};
+    return { titulo: c.titulo || c.archivo || '(canción que ya no está)', artista: c.artista || '', album: c.album || '', genero: c.genero || '', presente: S.canciones.has(id) };
+  }
+  function estadisticas(desde, hasta) {
+    const es = (S.escuchas || []).filter(e => e.fecha >= desde && e.fecha < hasta);
+    const r = { escuchas: 0, saltos: 0, minutos: 0, porCancion: new Map(), porArtista: new Map(), porAlbum: new Map(), porGenero: new Map(), dias: new Set(), porDia: [0, 0, 0, 0, 0, 0, 0], porHora: new Array(24).fill(0) };
+    const sumar = (m, k) => { if (k) m.set(k, (m.get(k) || 0) + 1); };
+    for (const e of es) {
+      r.minutos += (e.segundos || 0) / 60;
+      if (e.clase === 'salto') { r.saltos++; continue; }
+      r.escuchas++;
+      const d = datosCancion(e.cancionId);
+      sumar(r.porCancion, e.cancionId); sumar(r.porArtista, d.artista); sumar(r.porAlbum, d.album); sumar(r.porGenero, d.genero);
+      r.dias.add(e.fecha.slice(0, 10));
+      const f = new Date(e.fecha.replace(' ', 'T'));
+      r.porDia[f.getDay()]++; r.porHora[f.getHours()]++;
+    }
+    r.nuevas = [...S.canciones.values()].filter(c => (c.alta || '') >= desde && (c.alta || '') < hasta).length;
+    r.favMarcadas = S.cambios.filter(x => x.campo === 'favorita' && x.despues && x.fecha >= desde && x.fecha < hasta && !x.deshecho).length;
+    return r;
+  }
+  const top = (m, n) => [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
+  function variacion(act, ant) {
+    if (!ant) return act ? '<span class="bien">nuevo</span>' : '';
+    const p = Math.round((act - ant) / ant * 100);
+    return p === 0 ? '<span class="suave">igual</span>' : `<span class="${p > 0 ? 'bien' : 'mal'}">${p > 0 ? '▲' : '▼'} ${Math.abs(p)} %</span>`;
+  }
+  function barras(items, accion) {
+    if (!items.length) return '<p class="suave peq">Todavía sin datos en este periodo.</p>';
+    const max = Math.max(1, ...items.map(x => x[1]));
+    return items.map(([k, n], i) => `<div ${accion ? accion(k) : ''} style="margin:7px 0;${accion ? 'cursor:pointer' : ''}">
+      <div style="display:flex;justify-content:space-between;gap:8px;font-weight:700"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${i + 1}. ${esc(k)}</span><span class="num">▶ ${miles(n)}</span></div>
+      <div class="progreso-carga" style="margin:3px 0;height:9px"><i style="width:${n / max * 100}%"></i></div></div>`).join('');
+  }
+  P.resumen = sub => {
+    const tipo = PERIODOS.some(p => p[0] === sub) ? sub : 'mes';
+    const [, nombre, anterior] = PERIODOS.find(p => p[0] === tipo);
+    const desde = inicioPeriodo(tipo, 0), hasta = '9999';
+    const r = estadisticas(desde, hasta);
+    const a = tipo === 'todo' ? null : estadisticas(inicioPeriodo(tipo, 1), desde);
+    const topCanciones = top(r.porCancion, 10);
+    S._topResumen = topCanciones.map(x => x[0]).filter(id => S.canciones.has(id));
+    const diaFav = r.escuchas ? r.porDia.indexOf(Math.max(...r.porDia)) : -1;
+    const horaFav = r.escuchas ? r.porHora.indexOf(Math.max(...r.porHora)) : -1;
+    const filtrarPor = (campo) => k => `data-accion="usarSugerencia" data-campo="${campo}" data-v="${esc(k)}" data-ir-bib="1"`;
+    // Mes a mes (últimos 12 meses)
+    const meses = [];
+    for (let i = 0; i < 12; i++) {
+      const ini = inicioPeriodo('mes', i), fin = i ? inicioPeriodo('mes', i - 1) : '9999';
+      const s = estadisticas(ini, fin);
+      if (!s.escuchas && !s.saltos && i > 0) continue;
+      const tc = top(s.porCancion, 1)[0], ta = top(s.porArtista, 1)[0];
+      meses.push(`<tr><td>${MESES[+ini.slice(5, 7) - 1]} ${ini.slice(0, 4)}</td><td class="num">${miles(s.escuchas)}</td><td class="num">${miles(Math.round(s.minutos))}</td>
+        <td>${ta ? esc(ta[0]) : '—'}</td><td>${tc ? esc(datosCancion(tc[0]).titulo) : '—'}</td></tr>`);
+    }
+    return `<div class="desliza" style="margin:0 -16px 12px">${PERIODOS.map(([k, t]) => `<a class="chip${tipo === k ? ' on' : ''}" href="#/resumen/${k}" style="text-decoration:none;display:flex;align-items:center">${t}</a>`).join('')}</div>
+      <h2 style="margin-top:4px">📈 ${nombre}</h2>
+      <div class="tarjetas">
+        <div class="tarjeta" style="cursor:default"><span class="t-et">▶ Escuchas</span><span class="t-val">${miles(r.escuchas)}</span><span class="t-sub">${a ? variacion(r.escuchas, a.escuchas) + ' vs ' + anterior : 'en total'}</span></div>
+        <div class="tarjeta" style="cursor:default"><span class="t-et">⏱ Minutos escuchados</span><span class="t-val">${miles(Math.round(r.minutos))}</span><span class="t-sub">${a ? variacion(r.minutos, a.minutos) + ' vs ' + anterior : `${miles(Math.round(r.minutos / 60))} horas`}</span></div>
+        <div class="tarjeta" style="cursor:default"><span class="t-et">🎵 Canciones distintas</span><span class="t-val">${miles(r.porCancion.size)}</span><span class="t-sub">${miles(r.porArtista.size)} artistas</span></div>
+        <div class="tarjeta" style="cursor:default"><span class="t-et">⏭ Saltos</span><span class="t-val">${miles(r.saltos)}</span><span class="t-sub">${r.escuchas + r.saltos ? Math.round(r.saltos / (r.escuchas + r.saltos) * 100) : 0} % de lo que suena</span></div>
+        <div class="tarjeta" style="cursor:default"><span class="t-et">📅 Días con música</span><span class="t-val">${miles(r.dias.size)}</span><span class="t-sub">${diaFav >= 0 ? 'más los ' + DIAS[diaFav] : ''}</span></div>
+        <div class="tarjeta" style="cursor:default"><span class="t-et">🕐 Hora favorita</span><span class="t-val">${horaFav >= 0 ? `${horaFav}:00` : '—'}</span><span class="t-sub">${r.nuevas ? `${miles(r.nuevas)} canciones nuevas` : ''}${r.favMarcadas ? ` · ${r.favMarcadas} ❤ nuevas` : ''}</span></div>
+      </div>
+      <h2>🔥 Canciones más escuchadas</h2>
+      ${topCanciones.length ? `<div class="lista">${topCanciones.map(([id, n], i) => { const c = S.canciones.get(id); return c ? filaCancion(c, i, { rank: i + 1, dato: '▶ ' + miles(n) }) : `<div class="cancion"><div class="rank">${i + 1}</div><div class="c-txt"><b>${esc(datosCancion(id).titulo)}</b><span>ya no está en el teléfono</span></div><div class="c-der">▶ ${miles(n)}</div></div>`; }).join('')}</div>
+        <div class="botones dos"><button class="btn prim" data-accion="sonarTopResumen">▶ Sonar este top</button><button class="btn sec" data-accion="listaTopResumen" data-nombre="${esc('Top ' + nombre.toLowerCase())}">🗂️ Guardar como lista</button></div>` : '<p class="suave">Todavía no hay escuchas en este periodo. Cada canción que suene se cuenta aquí.</p>'}
+      <h2>🎤 Artistas favoritos</h2><div class="caja">${barras(top(r.porArtista, 10), filtrarPor('artistas'))}</div>
+      <h2>🏷️ Categorías favoritas</h2><div class="caja">${barras(top(r.porAlbum, 8), filtrarPor('categorias'))}</div>
+      <h2>🎸 Géneros favoritos</h2><div class="caja">${barras(top(r.porGenero, 8), filtrarPor('generos'))}</div>
+      <h2>📅 Cuándo escuchas</h2><div class="caja">${barras([1, 2, 3, 4, 5, 6, 0].map(d => [DIAS[d], r.porDia[d]]).filter(x => x[1]), null)}</div>
+      <h2>📆 Mes a mes</h2>
+      <div class="caja" style="overflow-x:auto"><table class="peq" style="width:100%;border-collapse:collapse"><thead><tr style="text-align:left"><th>Mes</th><th>▶</th><th>Min</th><th>Artista top</th><th>Canción top</th></tr></thead>
+        <tbody>${meses.join('') || '<tr><td colspan="5" class="suave">Sin datos todavía.</td></tr>'}</tbody></table></div>
+      <p class="suave peq">Se cuenta como escucha lo que suena 30 s o más, la mitad de la canción o completa; lo demás es salto.</p>`;
+  };
+
+  // Búsqueda inteligente: además de las canciones, muestra los artistas, categorías, géneros, años y carpetas
+  // cuyo nombre coincide (desde las primeras letras). Un toque y queda filtrado por eso.
+  function sugerenciasBusqueda(q) {
+    const partes = norm(q).split(/\s+/).filter(Boolean);
+    if (!partes.length) return '';
+    const coincide = t => { const n = norm(t); return partes.every(p => n.includes(p)); };
+    const grupos = [['artistas', '🎤'], ['categorias', '🏷️'], ['generos', '🎸'], ['anios', '📆'], ['carpetas', '📁']];
+    const html = grupos.map(([campo, ic]) => {
+      const vals = valoresDe(campo).filter(([v]) => !String(v).startsWith('(sin') && coincide(v)).slice(0, 8);
+      return vals.map(([v, n]) => `<button class="chip" data-accion="usarSugerencia" data-campo="${campo}" data-v="${esc(v)}">${ic} ${esc(v)} <small>${miles(n)}</small></button>`).join('');
+    }).join('');
+    return html ? `<p class="suave peq" style="margin:6px 2px">También coincide con (toca para filtrar):</p><div class="chips" style="margin-bottom:8px">${html}</div>` : '';
+  }
   function cabTop(conteo, tot, modo) {
-    return `<div class="tarjetas">${conteo.slice(0, 4).map(([e, n]) => `<button class="tarjeta" data-accion="verEstatus" data-v="${e.clave}"><span class="t-et">${e.nombre}</span><span class="t-val">${miles(n)}</span><span class="t-sub">canciones</span></button>`).join('')}
+    return `<a class="btn prim" href="#/resumen/mes" style="margin-bottom:12px">📈 Mi resumen: semana, mes, trimestre y año</a>
+      <div class="tarjetas">${conteo.slice(0, 4).map(([e, n]) => `<button class="tarjeta" data-accion="verEstatus" data-v="${e.clave}"><span class="t-et">${e.nombre}</span><span class="t-val">${miles(n)}</span><span class="t-sub">canciones</span></button>`).join('')}
       <button class="tarjeta" data-ir="#/top/escuchadas"><span class="t-et">▶ Escuchas</span><span class="t-val">${miles(tot.esc)}</span><span class="t-sub">en total</span></button>
       <button class="tarjeta" data-ir="#/top/saltadas"><span class="t-et">⏭ Saltos</span><span class="t-val">${miles(tot.sal)}</span><span class="t-sub">en total</span></button>
       <button class="tarjeta" data-accion="sonarFuente" data-f='${esc(JSON.stringify({ tipo: 'favoritas', nombre: '❤ Favoritas' }))}'><span class="t-et">❤ Favoritas</span><span class="t-val">${miles([...S.canciones.values()].filter(c => c.favorita).length)}</span><span class="t-sub">toca para sonar</span></button>
@@ -1341,8 +1603,18 @@
       Guárdalo en Drive, OneDrive o envíatelo por WhatsApp.</p></div>
       <div class="botones">${navigator.canShare ? '<button class="btn prim" data-accion="respaldoCompartir">📲 Guardar respaldo (Drive, WhatsApp…)</button>' : ''}
       <div class="botones dos" style="margin:0"><button class="btn sec" data-accion="respaldoDescargar">⬇ Descargar respaldo</button><button class="btn sec" data-accion="restaurar">📂 Restaurar</button></div></div>
-      <h2>📁 Mis carpetas de música</h2>
-      ${puedeCarpeta() ? `<div class="caja">
+      ${NATIVO ? (() => { const t = [...S.canciones.values()], I = S.infoAndroid || {};
+        return `<h2>🎵 Música del teléfono</h2><div class="caja">
+        <p><b>${miles(t.filter(c => c.origen === 'android').length)}</b> canciones, del catálogo de música de Android.</p>
+        <p class="suave peq">Con género: ${miles(t.filter(c => c.genero).length)} · con categoría (álbum): ${miles(t.filter(c => c.album).length)} · con año: ${miles(t.filter(c => anioDe(c)).length)}</p>
+        <p class="suave peq">Última revisión: ${S.ultimoEscaneo ? fechaCorta(S.ultimoEscaneo) : 'nunca'}${I.noMusica ? ` · ${miles(I.noMusica)} audios que no son música (notas de voz, tonos) no se muestran` : ''}</p>
+        <label class="opcion"><input type="checkbox" data-ajuste="autoEscaneo"${S.config.autoEscaneo ? ' checked' : ''}> Revisar sola al abrir la app (canciones nuevas o borradas)</label>
+        <div class="botones"><button class="btn prim" data-accion="cargarAndroid">🔄 Actualizar mi música ahora</button>
+        <button class="btn sec chico" data-accion="diagnostico" style="width:100%">📋 Diagnóstico (copiar para enviar a Claude)</button>
+        <button class="btn sec chico" data-accion="nuevaVersion" style="width:100%">⬇ Buscar una versión nueva de la app</button></div>
+        <p class="ayuda">Para que no se corte en el carro: Ajustes › Aplicaciones › Mi Música › Batería › <b>Sin restricciones</b>.</p></div>`; })() : ''}
+      ${NATIVO ? '' : '<h2>📁 Mis carpetas de música</h2>'}
+      ${NATIVO ? '' : puedeCarpeta() ? `<div class="caja">
         ${S.raices.length ? S.raices.map(r => { const n = [...S.canciones.values()].filter(c => c.origen === 'carpeta' && (c.raiz || 'r0') === r.id).length;
           return `<div style="display:flex;align-items:center;gap:8px;margin:6px 0"><span style="flex:1">📁 <b>${esc(r.h.name)}</b> · ${miles(n)} canciones${r.ok ? '' : ' <span class="aviso">(falta permiso)</span>'}</span>
             <button class="btn chico peligro" data-accion="quitarCarpeta" data-id="${esc(r.id)}" aria-label="Desconectar">✖</button></div>`; }).join('') : '<p>Ninguna carpeta conectada.</p>'}
@@ -1359,13 +1631,13 @@
         <div class="botones">${S.carpeta ? '<button class="btn prim" data-accion="escanear">🔍 Buscar canciones nuevas o borradas</button><button class="btn sec chico" data-accion="escanearCompleto" style="width:100%">🔬 Revisión completa (si editaste datos dentro de los archivos)</button>' : ''}
         </div>`
       : '<p class="suave peq">Este teléfono no deja conectar una carpeta. Las canciones se copian dentro de la app.</p>'}
-      <details class="sel"><summary><b>Copiar canciones dentro de la app</b> <span class="suave">(opción de respaldo)</span></summary><div class="botones">
+      ${NATIVO ? '' : `<details class="sel"><summary><b>Copiar canciones dentro de la app</b> <span class="suave">(opción de respaldo)</span></summary><div class="botones">
       <button class="btn sec" data-accion="actualizarBiblioteca">🔄 Actualizar desde una carpeta (copiando)</button>
       <div class="botones dos" style="margin:0"><button class="btn sec" data-accion="agregarCarpeta">📁 Agregar carpeta</button><button class="btn sec" data-accion="agregar">➕ Canciones sueltas</button></div></div></details>
       <h2>🚗 Para el carro</h2><div class="caja peq">
       <p>• La música <b>sigue sonando</b> aunque abras el GPS u otra app. Los controles quedan en la <b>barra de notificaciones</b> y en la pantalla bloqueada; también funcionan los del volante y el Bluetooth.</p>
       <p>• 🪟 <b>Ventana flotante</b>: en «Sonando», toca 🪟 y luego sal a tu GPS. Queda una ventanita con la canción y ⏮ ⏯ ⏭.</p>
-      <p>• Para que el teléfono no la cierre: Ajustes del teléfono › Aplicaciones › <b>Chrome</b> › Batería › <b>Sin restricciones</b>.</p></div>
+      <p>• Para que el teléfono no la cierre: Ajustes del teléfono › Aplicaciones › <b>Chrome</b> › Batería › <b>Sin restricciones</b>.</p></div>`}
       <h2>📊 Informes</h2><div class="botones dos">
       <button class="btn sec" data-ir="#/historial">🕘 Historial</button>
       <button class="btn sec" data-accion="excel" data-tipo="canciones">📊 Excel de estatus</button></div>
@@ -1374,7 +1646,7 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 10 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 11 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
@@ -1385,10 +1657,10 @@
       ${estrellasHtml(c, 'estrellasMenu')}
       <button class="opcion" data-accion="favoritaMenu" data-id="${esc(id)}"><span class="ic">${c.favorita ? '💔' : '❤'}</span>${c.favorita ? 'Quitar de favoritas' : 'Marcar como favorita'}</button>
       <button class="opcion" data-accion="sonarYa" data-id="${esc(id)}"><span class="ic">▶</span>Sonar ahora</button>
-      <button class="opcion" data-accion="despues" data-id="${esc(id)}"><span class="ic">⏭</span>Sonar después de la actual</button>
+      <button class="opcion" data-accion="despues" data-id="${esc(id)}"><span class="ic">⏭</span>Reproducir a continuación</button>
+      <button class="opcion" data-accion="alFinal" data-id="${esc(id)}"><span class="ic">➕</span>Agregar al final de la cola</button>
+      <button class="opcion" data-accion="aListaMenu" data-id="${esc(id)}"><span class="ic">🗂️</span>Agregar a una lista (existente o nueva)</button>
       <button class="opcion" data-accion="editarDatos" data-id="${esc(id)}"><span class="ic">✏️</span>Corregir datos (título, artista, categoría, género, año)</button>
-      ${normales.length ? `<h3>➕ Agregar a una lista</h3>${normales.map(l => `<button class="opcion" data-accion="${l.ids.includes(id) ? 'deLista' : 'aLista'}" data-uid="${esc(l.uid)}" data-id="${esc(id)}"><span class="ic">${l.ids.includes(id) ? '✔' : '🗂️'}</span>${esc(l.nombre)}${l.ids.includes(id) ? ' <small class="suave">(toca para sacarla)</small>' : ''}</button>`).join('')}` : ''}
-      <button class="opcion" data-accion="nuevaListaCon" data-id="${esc(id)}"><span class="ic">🆕</span>Lista nueva con esta canción</button>
       <button class="opcion" data-accion="historialCancion" data-id="${esc(id)}"><span class="ic">🕘</span>Historial de esta canción</button>
       <button class="opcion" data-accion="quitarApp" data-id="${esc(id)}" style="color:var(--mal)"><span class="ic">🗑</span>Quitar de la app (libera espacio)</button>
       <p class="suave peq">${esc(c.archivo)} · agregada ${fechaCorta(c.alta)}</p>
@@ -1412,6 +1684,33 @@
       ${S.listas.size ? '<h3>🗂️ Mis listas</h3>' + [...S.listas.values()].map(l => f({ tipo: 'lista', valor: l.uid, nombre: l.nombre }, l.reglas ? '⚡' : '🗂️', l.nombre, idsDeLista(l).length)).join('') : ''}
       ${cats.length ? '<h3>🏷️ Categorías</h3>' + cats.map(([v, n]) => f({ tipo: 'categoria', valor: v, nombre: v }, '🏷️', v, n)).join('') : ''}
       <button class="btn sec" data-accion="cerrar">Cerrar</button>`);
+  }
+  // Ventana para agregar una canción a una lista existente (✔ = ya está; tocar la saca) o crear una nueva
+  function menuListas(id) {
+    const c = S.canciones.get(id); if (!c) return;
+    const normales = [...S.listas.values()].filter(l => !l.reglas).sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    modal(`<h2>🗂️ Agregar a una lista</h2><p class="suave">${esc(c.titulo || c.archivo)}</p>
+      <div class="campo"><label>🆕 Lista nueva</label><div style="display:flex;gap:8px"><input id="nlCancion" placeholder="Nombre de la lista nueva" autocomplete="off">
+      <button class="btn prim chico" data-accion="nuevaListaDesdeMenu" data-id="${esc(id)}">Crear</button></div></div>
+      ${normales.length ? `<h3>Mis listas</h3>${normales.map(l => `<button class="opcion" data-accion="${l.ids.includes(id) ? 'deLista' : 'aLista'}" data-uid="${esc(l.uid)}" data-id="${esc(id)}"><span class="ic">${l.ids.includes(id) ? '✔' : '🗂️'}</span>${esc(l.nombre)} <small class="suave">${miles(idsDeLista(l).length)}${l.ids.includes(id) ? ' · ya está (toca para sacarla)' : ''}</small></button>`).join('')}` : '<p class="suave peq">Todavía no tienes listas normales. Crea una arriba.</p>'}
+      <p class="ayuda">Las listas ⚡ inteligentes se llenan solas con sus reglas; por eso no aparecen aquí.</p>
+      <button class="btn sec" data-accion="cerrar">Listo</button>`);
+  }
+  // Cola visible en «Sonando»: las próximas 20 canciones
+  function colaHtml() {
+    if (!S.cola.length || S.pos < 0) return '';
+    const sig = S.cola.slice(S.pos + 1, S.pos + 21).map((id, k) => [S.pos + 1 + k, S.canciones.get(id)]).filter(x => x[1]);
+    if (!sig.length) return '';
+    return `<div class="cola solo-normal" id="colaSonando"><div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:8px 0">☰ A continuación</h3>
+      <span class="suave peq">${miles(S.cola.length - S.pos - 1)} en cola</span></div>
+      <div class="lista">${sig.map(([p, c], k) => `<div class="cancion" data-accion="sonarPos" data-p="${p}"><div class="rank">${k + 1}</div>
+        <div class="c-txt"><b>${esc(c.titulo || c.archivo)}</b><span>${esc(c.artista || '')}${categoriaDe(c) ? ' · ' + esc(categoriaDe(c)) : ''}</span></div>
+        <div class="c-der">${k ? `<button class="mas-btn" data-accion="subirCola" data-p="${p}" aria-label="Subir">⬆</button>` : ''}<button class="mas-btn" data-accion="quitarCola" data-p="${p}" aria-label="Quitar de la cola">✖</button></div></div>`).join('')}</div></div>`;
+  }
+  function refrescarCola() {
+    const el = $('#colaSonando');
+    if (el) el.outerHTML = colaHtml() || '<div id="colaSonando"></div>';
+    else if ((location.hash || '#/sonando').startsWith('#/sonando')) pintar();
   }
   function verCola() {
     const sig = S.cola.slice(S.pos, S.pos + 60).map((id, k) => [S.pos + k, S.canciones.get(id)]).filter(x => x[1]);
@@ -1557,11 +1856,39 @@
     toqueCategoria(b) { const v = b.dataset.v, a = S.filtros.categorias; S.filtros.categorias = a.includes(v) ? a.filter(x => x !== v) : [...a, v]; S.limite = 150; pintar(); },
     quitarValor(b) { const k = b.dataset.campo; S.filtros[k] = S.filtros[k].filter(x => x !== b.dataset.v); S.limite = 150; pintar(); },
     quitarTexto() { S.filtros.q = ''; S.limite = 150; pintar(); },
+    usarSugerencia(b) {
+      const k = b.dataset.campo, v = b.dataset.v; S.filtros.q = '';
+      if (b.dataset.irBib) CAMPOS_FILTRO.forEach(x => S.filtros[x] = []);   // desde Mi resumen: muestra solo eso
+      if (!S.filtros[k].includes(v)) S.filtros[k] = [...S.filtros[k], v]; S.limite = 150;
+      if (location.hash !== '#/biblioteca') location.hash = '#/biblioteca'; else pintar();
+    },
+    sonarTopResumen() { sonarFuente({ tipo: 'ids', ids: (S._topResumen || []).slice(), nombre: 'Top de mi resumen', enOrden: true }); },
+    async listaTopResumen(b) { const l = await crearLista(b.dataset.nombre + ' ' + ahora().slice(0, 10), (S._topResumen || []).slice()); toast('🗂️ Lista guardada'); location.hash = '#/lista/' + l.uid; },
+    // Cola de reproducción
+    alFinal(b) {
+      cerrarModal(); const id = b.dataset.id;
+      if (!S.cola.length) return A.sonarYa(b);
+      S.cola = S.cola.filter((x, i) => x !== id || i <= S.pos); S.cola.push(id); guardarEstado(); refrescarCola(); toast('➕ Agregada al final de la cola');
+    },
+    quitarCola(b) { const p = +b.dataset.p; if (p === S.pos) return; S.cola.splice(p, 1); if (p < S.pos) S.pos--; guardarEstado(); refrescarCola(); },
+    subirCola(b) { const p = +b.dataset.p; if (p <= S.pos + 1) return; [S.cola[p - 1], S.cola[p]] = [S.cola[p], S.cola[p - 1]]; guardarEstado(); refrescarCola(); },
+    aListaMenu(b) { menuListas(b.dataset.id); },
+    async nuevaListaDesdeMenu(b) {
+      const n = ($('#nlCancion') || {}).value; const nombre = (n || '').trim();
+      if (!nombre) return toast('Escribe el nombre de la lista', true);
+      await crearLista(nombre, [b.dataset.id]); toast(`🗂️ Lista «${nombre}» creada con la canción`); menuListas(b.dataset.id);
+    },
     menuCancion(b) { menuCancion(b.dataset.id); },
     sonarYa(b) { cerrarModal(); const id = b.dataset.id; if (S.actual) { S.cola.splice(S.pos + 1, 0, id); sonar(S.pos + 1); } else sonarFuente({ tipo: 'ids', ids: [id], nombre: 'Una canción' }); },
-    despues(b) { cerrarModal(); const id = b.dataset.id; if (!S.cola.length) return A.sonarYa(b); S.cola.splice(S.pos + 1, 0, id); guardarEstado(); toast('⏭ Suena después de la actual'); },
-    async aLista(b) { await agregarALista(b.dataset.uid, b.dataset.id); menuCancion(b.dataset.id); },
-    async deLista(b) { await sacarDeLista(b.dataset.uid, b.dataset.id); toast('➖ Sacada de la lista'); menuCancion(b.dataset.id); },
+    despues(b) {
+      cerrarModal(); const id = b.dataset.id;
+      if (!S.cola.length) return A.sonarYa(b);
+      // Si ya estaba más adelante en la cola, se mueve (no queda repetida)
+      S.cola = S.cola.filter((x, i) => x !== id || i <= S.pos); S.cola.splice(S.pos + 1, 0, id);
+      guardarEstado(); refrescarCola(); toast('⏭ Suena a continuación');
+    },
+    async aLista(b) { await agregarALista(b.dataset.uid, b.dataset.id); menuListas(b.dataset.id); },
+    async deLista(b) { await sacarDeLista(b.dataset.uid, b.dataset.id); toast('➖ Sacada de la lista'); menuListas(b.dataset.id); },
     async nuevaListaCon(b) { const n = prompt('Nombre de la lista nueva:'); if (!n) return; await crearLista(n.trim(), [b.dataset.id]); toast('🗂️ Lista creada'); menuCancion(b.dataset.id); },
     editarDatos(b) { editarDatos(b.dataset.id); },
     async guardarDatos(b) {
@@ -1647,7 +1974,7 @@
     },
     actualizarSi() { cerrarModal(); S._modo = 'actualizar'; $('#elegirCarpeta').click(); },
     conectarCarpeta, escanear() { escanear('manual'); }, escanearCompleto() { escanear('completo'); },
-    releerTodas() { releerTodas(); },
+    releerTodas() { if (NATIVO) escanearAndroid('manual'); else releerTodas(); },
     async diagnostico() {
       const t = diagnosticoTexto();
       let copiado = false;
@@ -1660,8 +1987,10 @@
     quitarCarpeta(b) { quitarCarpeta(b.dataset.id); },
     quitarCarpetaSi(b) { quitarCarpetaSi(b.dataset.id); },
     cancelarEscaneo() { S.cancelar = true; const x = $('#avTxt'); if (x) x.textContent = 'Cancelando…'; },
-    escaneoAplicar() { aplicarEscaneo(S._dif, 'manual'); },
-    async escaneoRespaldo() { await guardarRespaldo('descargar'); await aplicarEscaneo(S._dif, 'manual'); },
+    escaneoAplicar() { if (S._dif && S._dif.android) aplicarAndroid(S._dif, 'manual'); else aplicarEscaneo(S._dif, 'manual'); },
+    async escaneoRespaldo() { const d = S._dif; await guardarRespaldo('descargar'); if (d && d.android) await aplicarAndroid(d, 'manual'); else await aplicarEscaneo(d, 'manual'); },
+    cargarAndroid() { escanearAndroid('manual'); },
+    async nuevaVersion() { try { await Bib.abrir({ url: 'https://github.com/tabares022384-afk/mi-musica-app/releases/latest' }); } catch (e) { toast('⚠️ ' + e.message, true); } },
     async permisoCarpeta() { if (!(await pedirPermiso())) toast('Sin permiso no puedo leer tu carpeta', true); },
     flotante() { ventanaFlotante().catch(e => toast('⚠️ ' + e.message, true)); },
     respaldo() {
@@ -1716,7 +2045,7 @@
   });
 
   // ---------------------------------------------------------------- navegación
-  const TITULOS = { sonando: 'Sonando', biblioteca: 'Biblioteca', listas: 'Listas', lista: 'Lista', top: 'Estatus y ranking', historial: 'Historial', mas: 'Más' };
+  const TITULOS = { sonando: 'Sonando', biblioteca: 'Biblioteca', listas: 'Listas', lista: 'Lista', top: 'Estatus y ranking', historial: 'Historial', mas: 'Más', resumen: 'Mi resumen' };
   function pintar() {
     const partes = (location.hash || '#/sonando').slice(2).split('/');
     const r = P[partes[0]] ? partes[0] : 'sonando';
@@ -1725,8 +2054,8 @@
     if (pintar._ruta === location.hash) window.scrollTo(0, y); else window.scrollTo(0, 0);
     pintar._ruta = location.hash;
     $('#titulo').textContent = TITULOS[r] || 'Mi Música';
-    $('#atras').hidden = !['lista', 'historial'].includes(r);
-    document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('activo', a.dataset.r === r || (r === 'lista' && a.dataset.r === 'listas') || (r === 'historial' && a.dataset.r === 'mas')));
+    $('#atras').hidden = !['lista', 'historial', 'resumen'].includes(r);
+    document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('activo', a.dataset.r === r || (r === 'lista' && a.dataset.r === 'listas') || (r === 'historial' && a.dataset.r === 'mas') || (r === 'resumen' && a.dataset.r === 'top')));
     pintarMini(); actualizarProgreso();
     if (r === 'mas') DB.espacio().then(e => { const p = $('#espacio'); if (p && e) p.textContent = `Espacio usado por la app: ${(e.usage / 1073741824).toFixed(2)} GB de ${(e.quota / 1073741824).toFixed(0)} GB que el teléfono le permite.`; });
   }
@@ -1739,10 +2068,15 @@
       try { if (localStorage.getItem('mm-carro')) document.body.classList.add('carro'); } catch (e) {}
       if (!location.hash) location.hash = '#/sonando';
       pintar();
-      if (S.carpeta && S.permiso) alConectar();   // carga ubicaciones, completa datos pendientes y revisa la carpeta
+      if (NATIVO) {
+        S.infoAndroid = await DB.leerConfig('infoAndroid', null);
+        // App instalada: si ya tiene música, revisa sola lo nuevo o borrado (unos segundos, sin abrir archivos)
+        if ([...S.canciones.values()].some(c => c.origen === 'android') && S.config.autoEscaneo) escanearAndroid('auto');
+      }
+      else if (S.carpeta && S.permiso) alConectar();   // carga ubicaciones, completa datos pendientes y revisa la carpeta
       else if (S.carpeta) cargarManijas();          // se dejan listas; el permiso llega con el primer toque
     } catch (e) { vista.innerHTML = `<p class="mal">No se pudo abrir la base de datos: ${esc(e.message)}</p>`; }
-    if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    if (!NATIVO && 'serviceWorker' in navigator && location.protocol !== 'file:') {
       navigator.serviceWorker.register('sw.js').then(reg => {
         const avisar = w => { S.swEsperando = w; $('#actualizar').classList.add('ver'); };
         if (reg.waiting && navigator.serviceWorker.controller) avisar(reg.waiting);
