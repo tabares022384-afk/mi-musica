@@ -1328,8 +1328,8 @@
     return `<div class="solo-normal">${avisoCarpeta()}${avisoRespaldo()}</div><div class="repro">
       <button class="btn sec solo-carro" data-accion="modoCarro" style="max-width:260px">✖ Salir del modo carro</button>
       <div class="portada" style="background:${color(cat || c.artista)}">${esc(iniciales(c))}</div>
-      <div><p class="r-titulo">${esc(c.titulo || c.archivo)}</p><p class="r-artista">${esc(c.artista || 'Sin artista')}</p></div>
-      <div class="chips solo-normal" style="justify-content:center">${cat ? `<span class="etq">${esc(cat)}</span>` : ''}${c.genero ? `<span class="etq">${esc(c.genero)}</span>` : ''}${anioDe(c) ? `<span class="etq">${anioDe(c)}</span>` : ''}<span class="etq estatus">${e.nombre}</span></div>
+      <div><p class="r-titulo">${esc(c.titulo || c.archivo)}</p><p class="r-artista">${partesArtista(c.artista).length ? partesArtista(c.artista).map(n => `<a href="${enlaceArtista(n)}" class="enlace-artista">${esc(n)}</a>`).join(' · ') : 'Sin artista'}</p></div>
+      <div class="chips solo-normal" style="justify-content:center">${cat ? `<a class="etq" href="${enlaceAlbum(cat)}" style="text-decoration:none;color:inherit">💿 ${esc(cat)}</a>` : ''}${c.genero ? `<button class="etq" data-accion="irGenero" data-v="${esc(c.genero)}" style="cursor:pointer">🎸 ${esc(c.genero)}</button>` : ''}${anioDe(c) ? `<button class="etq" data-accion="irAnio" data-v="${anioDe(c)}" style="cursor:pointer">${anioDe(c)}</button>` : ''}<span class="etq estatus">${e.nombre}</span></div>
       <div class="progreso"><input type="range" id="barraTiempo" min="0" step="1" aria-label="Avance de la canción"><div class="tiempos"><span id="tActual">0:00</span><span id="tTotal">0:00</span></div></div>
       <div class="controles">
         <button class="ctl" data-accion="anterior" aria-label="Anterior">⏮</button>
@@ -1646,10 +1646,97 @@
       <label class="opcion"><input type="checkbox" data-ajuste="pantallaEncendida"${S.config.pantallaEncendida ? ' checked' : ''}> Pantalla siempre encendida en modo carro</label>
       <div class="campo"><label>Recordarme el respaldo cada</label><select data-ajuste-num="diasRespaldo">${[1, 3, 7, 15, 30].map(n => `<option value="${n}"${(S.config.diasRespaldo || 7) === n ? ' selected' : ''}>${n} ${n === 1 ? 'día' : 'días'}</option>`).join('')}</select></div>
       <button class="opcion" data-accion="tema"><span class="ic">🌓</span>Cambiar a modo ${document.documentElement.dataset.tema === 'claro' ? 'oscuro' : 'claro'}</button></div>
-      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 11 ·${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
+      <p class="suave peq" id="espacio"></p><p class="suave peq">Mi Música · versión 12 · ${miles(S.canciones.size)} canciones${S.memoria.size ? ` · ${miles(S.memoria.size)} recordadas fuera de la app` : ''}</p>`;
   };
 
   // ---------------------------------------------------------------- ventanas
+  // ======== EXPLORAR: artistas, colaboraciones, álbumes y géneros ========
+  // «A feat. B», «A ft B», «A & B», «A, B», «A x B», «A / B», «A + B», «A vs B» → [A, B]
+  const SEP_ARTISTAS = /\s*(?:,|;|&|\/|\+|\bfeat\.?\s+|\bft\.?\s+|\bfeaturing\s+|\bwith\s+|\s+x\s+|\s+vs\.?\s+)\s*/i;
+  function partesArtista(s) {
+    s = (s || '').trim(); if (!s) return [];
+    const p = [...new Set(s.split(SEP_ARTISTAS).map(x => x.trim()).filter(Boolean))];
+    return p.some(x => x.length <= 2) ? [s] : p;   // «AC/DC», «Q + U2»… no se parten
+  }
+  // Invitados que vienen en el título: «Canción (feat. B)», «Canción ft. B», «Canción [con B]».
+  // «con» y «with» solo cuentan DENTRO de paréntesis (así «Bailando con lobos» no es una colaboración).
+  function invitadosTitulo(t) {
+    t = t || '';
+    const m = /[([]\s*(?:feat\.?|ft\.?|featuring|con|with)\s+([^)\]]+)[)\]]/i.exec(t) || /\b(?:feat\.?|ft\.?|featuring)\s+(.+)$/i.exec(t);
+    return m ? partesArtista(m[1].replace(/[)\]]+$/, '')) : [];
+  }
+  const enlaceArtista = n => '#/artista/' + encodeURIComponent(n);
+  const enlaceAlbum = n => '#/album/' + encodeURIComponent(n);
+  // Canciones de un artista: las suyas (solo él) y las colaboraciones (con otros, o invitado en el título)
+  function obraDeArtista(nombre) {
+    return recordar('artista:' + nombre, () => {
+      const n = norm(nombre), propias = [], colab = [];
+      for (const c of S.canciones.values()) {
+        const completo = norm(c.artista);
+        const partes = partesArtista(c.artista).map(norm);
+        const invitado = invitadosTitulo(c.titulo).map(norm).includes(n);
+        if (completo === n && partes.length <= 1) propias.push(c);
+        else if (completo === n || partes.includes(n) || invitado) colab.push(c);
+      }
+      return { propias, colab };
+    });
+  }
+  const masEscuchadas = arr => arr.slice().sort((a, b) => total(b).esc - total(a).esc || puntos(b) - puntos(a) || COMPARAR(a.titulo || '', b.titulo || ''));
+  const contar = (arr, f) => { const m = new Map(); arr.forEach(c => [].concat(f(c)).forEach(k => { if (k) m.set(k, (m.get(k) || 0) + 1); })); return [...m.entries()].sort((a, b) => b[1] - a[1]); };
+  P.artista = (nombre, genero) => {
+    const { propias, colab } = obraDeArtista(nombre);
+    const todas = [...propias, ...colab];
+    if (!todas.length) return `<h2>🎤 ${esc(nombre)}</h2><p class="suave">No encontré canciones de este artista en tu teléfono.</p>`;
+    const g = genero || '';
+    const filtro = arr => g ? arr.filter(c => (c.genero || '(sin género)') === g) : arr;
+    const p = masEscuchadas(filtro(propias)), co = masEscuchadas(filtro(colab));
+    S._vistaIds = [...p, ...co].map(c => c.id);
+    const n = norm(nombre);
+    const generos = contar(todas, c => c.genero || '(sin género)');
+    const albumes = contar(todas, c => categoriaDe(c));
+    const socios = contar(colab, c => [...partesArtista(c.artista), ...invitadosTitulo(c.titulo)].filter(x => norm(x) !== n));
+    const esc_ = todas.reduce((s, c) => s + total(c).esc, 0), fav = todas.filter(c => c.favorita).length;
+    const fuente = JSON.stringify({ tipo: 'ids', ids: S._vistaIds, nombre: '🎤 ' + nombre + (g ? ' · ' + g : '') });
+    return `<h2 style="margin-top:4px">🎤 ${esc(nombre)}</h2>
+      <p class="suave">${miles(propias.length)} canciones${colab.length ? ` · ${miles(colab.length)} colaboraciones` : ''} · ▶ ${miles(esc_)} escuchas${fav ? ` · ❤ ${fav}` : ''}</p>
+      <div class="botones dos"><button class="btn prim" data-accion="sonarFuente" data-f='${esc(JSON.stringify({ tipo: 'ids', ids: S._vistaIds, nombre: '🎤 ' + nombre, enOrden: true }))}'>▶ Sonar (${miles(S._vistaIds.length)})</button>
+        <button class="btn sec" data-accion="sonarFuente" data-f='${esc(fuente)}'>🔀 Al azar</button></div>
+      <h3>🎸 Géneros${generos.length > 1 ? ` (toca varios estilos: ${generos.length})` : ''}</h3>
+      <div class="chips">${g ? `<a class="chip on" href="${enlaceArtista(nombre)}" style="text-decoration:none">${esc(g)} ✖</a>` : ''}${generos.filter(([x]) => x !== g).map(([x, k]) => `<a class="chip" href="${enlaceArtista(nombre)}/${encodeURIComponent(x)}" style="text-decoration:none">${esc(x)} <small>${miles(k)}</small></a>`).join('')}</div>
+      ${albumes.length ? `<h3>💿 Álbumes y categorías</h3><div class="chips">${albumes.map(([x, k]) => `<a class="chip" href="${enlaceAlbum(x)}" style="text-decoration:none">💿 ${esc(x)} <small>${miles(k)}</small></a>`).join('')}</div>` : ''}
+      ${socios.length ? `<h3>🤝 Ha cantado con</h3><div class="chips">${socios.slice(0, 20).map(([x, k]) => `<a class="chip" href="${enlaceArtista(x)}" style="text-decoration:none">🎤 ${esc(x)} <small>${miles(k)}</small></a>`).join('')}</div>` : ''}
+      <h2>🎵 Sus canciones${g ? ' de ' + esc(g) : ''} <small class="suave">(${miles(p.length)})</small></h2>
+      <div class="lista">${p.slice(0, 200).map((c, i) => filaCancion(c, i)).join('') || '<p class="suave">—</p>'}</div>
+      ${co.length ? `<h2>🤝 Colaboraciones <small class="suave">(${miles(co.length)})</small></h2><div class="lista">${co.slice(0, 200).map((c, i) => filaCancion(c, p.length + i)).join('')}</div>` : ''}`;
+  };
+  P.album = nombre => {
+    const canciones = [...S.canciones.values()].filter(c => categoriaDe(c) === nombre).sort((a, b) => COMPARAR(a.titulo || '', b.titulo || ''));
+    if (!canciones.length) return `<h2>💿 ${esc(nombre)}</h2><p class="suave">No hay canciones con este álbum.</p>`;
+    S._vistaIds = canciones.map(c => c.id);
+    const artistas = contar(canciones, c => partesArtista(c.artista));
+    const generos = contar(canciones, c => c.genero);
+    const anios = contar(canciones, c => anioDe(c)).map(x => x[0]).sort();
+    return `<h2 style="margin-top:4px">💿 ${esc(nombre)}</h2>
+      <p class="suave">${miles(canciones.length)} canciones${anios.length ? ` · ${anios[0]}${anios.length > 1 ? '–' + anios[anios.length - 1] : ''}` : ''} · ▶ ${miles(canciones.reduce((s, c) => s + total(c).esc, 0))} escuchas</p>
+      <div class="botones dos"><button class="btn prim" data-accion="sonarFuente" data-f='${esc(JSON.stringify({ tipo: 'ids', ids: S._vistaIds, nombre: '💿 ' + nombre, enOrden: true }))}'>▶ Sonar en orden</button>
+        <button class="btn sec" data-accion="sonarFuente" data-f='${esc(JSON.stringify({ tipo: 'ids', ids: S._vistaIds, nombre: '💿 ' + nombre }))}'>🔀 Al azar</button></div>
+      <h3>🎤 Artistas</h3><div class="chips">${artistas.slice(0, 30).map(([x, k]) => `<a class="chip" href="${enlaceArtista(x)}" style="text-decoration:none">🎤 ${esc(x)} <small>${miles(k)}</small></a>`).join('')}</div>
+      ${generos.length ? `<h3>🎸 Géneros</h3><div class="chips">${generos.map(([x, k]) => `<button class="chip" data-accion="irGenero" data-v="${esc(x)}">${esc(x)} <small>${miles(k)}</small></button>`).join('')}</div>` : ''}
+      <div class="lista" style="margin-top:12px">${canciones.slice(0, 300).map((c, i) => filaCancion(c, i)).join('')}</div>`;
+  };
+  // Sección «Explorar» del menú ⋮: artista(s), álbum, género y año de la canción
+  function explorarHtml(c) {
+    const art = partesArtista(c.artista), inv = invitadosTitulo(c.titulo).filter(x => !art.map(norm).includes(norm(x)));
+    const nombres = [...(art.length > 1 ? [c.artista.trim()] : []), ...art, ...inv];
+    const cuenta = n => { const o = obraDeArtista(n); return o.propias.length + o.colab.length; };
+    const b = (h, ic, t, n) => `<button class="opcion" data-accion="irA" data-h="${esc(h)}"><span class="ic">${ic}</span>${t} <small class="suave">${n != null ? miles(n) : ''}</small></button>`;
+    const cat = categoriaDe(c), y = anioDe(c);
+    return `<h3>🔎 Explorar</h3>
+      ${nombres.map((n, i) => b(enlaceArtista(n), '🎤', `Ver artista: <b>${esc(n)}</b>${art.length > 1 && i === 0 ? ' (juntos)' : inv.includes(n) ? ' (invitado)' : ''}`, cuenta(n))).join('')}
+      ${cat ? b(enlaceAlbum(cat), '💿', `Ver álbum / categoría: <b>${esc(cat)}</b>`, [...S.canciones.values()].filter(x => categoriaDe(x) === cat).length) : ''}
+      ${c.genero ? `<button class="opcion" data-accion="irGenero" data-v="${esc(c.genero)}"><span class="ic">🎸</span>Más del género: <b>${esc(c.genero)}</b> <small class="suave">${miles([...S.canciones.values()].filter(x => x.genero === c.genero).length)}</small></button>` : ''}
+      ${y ? `<button class="opcion" data-accion="irAnio" data-v="${esc(y)}"><span class="ic">📆</span>Más del año: <b>${y}</b></button>` : ''}`;
+  }
   function menuCancion(id) {
     const c = S.canciones.get(id); if (!c) return;
     const normales = [...S.listas.values()].filter(l => !l.reglas);
@@ -1660,6 +1747,8 @@
       <button class="opcion" data-accion="despues" data-id="${esc(id)}"><span class="ic">⏭</span>Reproducir a continuación</button>
       <button class="opcion" data-accion="alFinal" data-id="${esc(id)}"><span class="ic">➕</span>Agregar al final de la cola</button>
       <button class="opcion" data-accion="aListaMenu" data-id="${esc(id)}"><span class="ic">🗂️</span>Agregar a una lista (existente o nueva)</button>
+      ${explorarHtml(c)}
+      <h3>⚙️ Más</h3>
       <button class="opcion" data-accion="editarDatos" data-id="${esc(id)}"><span class="ic">✏️</span>Corregir datos (título, artista, categoría, género, año)</button>
       <button class="opcion" data-accion="historialCancion" data-id="${esc(id)}"><span class="ic">🕘</span>Historial de esta canción</button>
       <button class="opcion" data-accion="quitarApp" data-id="${esc(id)}" style="color:var(--mal)"><span class="ic">🗑</span>Quitar de la app (libera espacio)</button>
@@ -1856,6 +1945,9 @@
     toqueCategoria(b) { const v = b.dataset.v, a = S.filtros.categorias; S.filtros.categorias = a.includes(v) ? a.filter(x => x !== v) : [...a, v]; S.limite = 150; pintar(); },
     quitarValor(b) { const k = b.dataset.campo; S.filtros[k] = S.filtros[k].filter(x => x !== b.dataset.v); S.limite = 150; pintar(); },
     quitarTexto() { S.filtros.q = ''; S.limite = 150; pintar(); },
+    irA(b) { cerrarModal(); location.hash = b.dataset.h; },
+    irGenero(b) { cerrarModal(); CAMPOS_FILTRO.forEach(x => S.filtros[x] = []); S.filtros.q = ''; S.filtros.generos = [b.dataset.v]; S.limite = 150; if (location.hash !== '#/biblioteca') location.hash = '#/biblioteca'; else pintar(); },
+    irAnio(b) { cerrarModal(); CAMPOS_FILTRO.forEach(x => S.filtros[x] = []); S.filtros.q = ''; S.filtros.anios = [b.dataset.v]; S.limite = 150; if (location.hash !== '#/biblioteca') location.hash = '#/biblioteca'; else pintar(); },
     usarSugerencia(b) {
       const k = b.dataset.campo, v = b.dataset.v; S.filtros.q = '';
       if (b.dataset.irBib) CAMPOS_FILTRO.forEach(x => S.filtros[x] = []);   // desde Mi resumen: muestra solo eso
@@ -2045,17 +2137,18 @@
   });
 
   // ---------------------------------------------------------------- navegación
-  const TITULOS = { sonando: 'Sonando', biblioteca: 'Biblioteca', listas: 'Listas', lista: 'Lista', top: 'Estatus y ranking', historial: 'Historial', mas: 'Más', resumen: 'Mi resumen' };
+  const TITULOS = { sonando: 'Sonando', biblioteca: 'Biblioteca', listas: 'Listas', lista: 'Lista', top: 'Estatus y ranking', historial: 'Historial', mas: 'Más', resumen: 'Mi resumen', artista: 'Artista', album: 'Álbum' };
+  const decodificar = s => { try { return decodeURIComponent(s || ''); } catch (e) { return s || ''; } };
   function pintar() {
     const partes = (location.hash || '#/sonando').slice(2).split('/');
     const r = P[partes[0]] ? partes[0] : 'sonando';
     const y = window.scrollY;
-    vista.innerHTML = P[r](decodeURIComponent(partes[1] || ''));
+    vista.innerHTML = P[r](decodificar(partes[1]), decodificar(partes[2]));
     if (pintar._ruta === location.hash) window.scrollTo(0, y); else window.scrollTo(0, 0);
     pintar._ruta = location.hash;
     $('#titulo').textContent = TITULOS[r] || 'Mi Música';
-    $('#atras').hidden = !['lista', 'historial', 'resumen'].includes(r);
-    document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('activo', a.dataset.r === r || (r === 'lista' && a.dataset.r === 'listas') || (r === 'historial' && a.dataset.r === 'mas') || (r === 'resumen' && a.dataset.r === 'top')));
+    $('#atras').hidden = !['lista', 'historial', 'resumen', 'artista', 'album'].includes(r);
+    document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('activo', a.dataset.r === r || (r === 'lista' && a.dataset.r === 'listas') || (r === 'historial' && a.dataset.r === 'mas') || (r === 'resumen' && a.dataset.r === 'top') || ((r === 'artista' || r === 'album') && a.dataset.r === 'biblioteca')));
     pintarMini(); actualizarProgreso();
     if (r === 'mas') DB.espacio().then(e => { const p = $('#espacio'); if (p && e) p.textContent = `Espacio usado por la app: ${(e.usage / 1073741824).toFixed(2)} GB de ${(e.quota / 1073741824).toFixed(0)} GB que el teléfono le permite.`; });
   }
